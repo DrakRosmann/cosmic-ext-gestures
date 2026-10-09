@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- A touchpad, three fingertips on it, swiping up. -->
+  <rect x="10" y="22" width="108" height="84" rx="16" fill="#2b2b2b"/>
+  <rect x="16" y="28" width="96" height="72" rx="11" fill="#3a3a3a"/>
+  <circle cx="44" cy="74" r="9" fill="#f4a8b4"/>
+  <circle cx="64" cy="70" r="9" fill="#f4a8b4"/>
+  <circle cx="84" cy="74" r="9" fill="#f4a8b4"/>
+  <path d="M64 56 V36 M54 46 L64 36 L74 46" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

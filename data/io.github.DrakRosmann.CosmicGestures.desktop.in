@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Touchpad Gestures
+Name[pt_BR]=Gestos do touchpad
+Comment=Choose what swiping with three or four fingers does
+Comment[pt_BR]=Escolha o que deslizar com três ou quatro dedos faz
+Type=Application
+Exec=@bindir@/cosmic-ext-gestures
+Icon=io.github.DrakRosmann.CosmicGestures
+Terminal=false
+Categories=COSMIC;Settings;HardwareSettings;
+Keywords=COSMIC;Touchpad;Gestures;Swipe;Gestos;
+StartupNotify=true

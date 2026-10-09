@@ -1,0 +1,23 @@
+[package]
+name = "cosmic-ext-gestures"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Touchpad gestures for COSMIC, like GNOME's, and an app to set them"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", default-features = false, features = [
+    "dbus-config",
+    "tokio",
+    "wayland",
+    "winit",
+] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+
+[patch."https://github.com/smithay/client-toolkit.git"]
+sctk = { package = "smithay-client-toolkit", version = "0.20.0" }
+
+[patch."https://github.com/pop-os/cosmic-protocols"]
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "32283d7" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "32283d7" }
