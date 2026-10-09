@@ -1,0 +1,837 @@
+diff --git a/src/backend/render/mod.rs b/src/backend/render/mod.rs
+index 9ad6158..311fb59 100644
+--- a/src/backend/render/mod.rs
++++ b/src/backend/render/mod.rs
+@@ -683,7 +683,9 @@ where
+ 
+     std::mem::drop(shell_guard);
+ 
+-    let element_filter = if workspace_overview_is_open(output) {
++    let element_filter = if workspace_overview_is_open(output)
++        && !crate::shell::layer_animation::overview_opening(output)
++    {
+         ElementFilter::LayerShellOnly
+     } else {
+         ElementFilter::All
+@@ -833,6 +835,43 @@ where
+         )
+     };
+ 
++    // Layers opening grow around a point of theirs too.
++    let crop_to_output_scaled =
++        |element: WorkspaceRenderElement<R>, origin: Point<f64, Logical>, by: f64| {
++            let focal = focal_point
++                .as_logical()
++                .to_physical(output.current_scale().fractional_scale())
++                .to_i32_round::<i32>()
++                .to_f64();
++            let origin = origin.to_physical(scale);
++            let total = by * zoom_scale;
++            // both scalings, as one around this
++            let around = if (1.0 - total).abs() < 1e-6 {
++                focal
++            } else {
++                Point::from((
++                    (focal.x * (1.0 - zoom_scale) + origin.x * zoom_scale * (1.0 - by))
++                        / (1.0 - total),
++                    (focal.y * (1.0 - zoom_scale) + origin.y * zoom_scale * (1.0 - by))
++                        / (1.0 - total),
++                ))
++            };
++            CropRenderElement::from_element(
++                RescaleRenderElement::from_element(element, around.to_i32_round(), total),
++                scale,
++                Rectangle::from_size(output_size),
++            )
++        };
++
++    // closing layers and popups, over everything
++    if element_filter != ElementFilter::ExcludeWorkspaceOverview {
++        for elem in crate::shell::layer_animation::closing_elements(renderer, output) {
++            let elem = CosmicMappedRenderElement::from(crate::utils::iced::IcedRenderElement::UI(elem));
++            elements.extend(crop_to_output(WorkspaceRenderElement::Window(elem)).map(Into::into));
++        }
++    }
++    let windows_alpha = crate::shell::layer_animation::windows_alpha(output);
++
+     render_input_order::<()>(&shell, output, previous, current, element_filter, |stage| {
+         match stage {
+             Stage::ZoomUI => {
+@@ -846,10 +885,10 @@ where
+                 })
+             }
+             Stage::LayerPopup {
++                layer,
+                 popup,
+                 location,
+                 workspace_idx,
+-                ..
+             } => {
+                 let mut geometry = popup.geometry().as_global();
+                 geometry.loc += location;
+@@ -865,6 +904,13 @@ where
+                     .map(|id| id.namespace_for_workspace(workspace_idx))
+                     .unwrap_or(workspace_idx);
+ 
++                let local_geometry = geometry.to_local(output).as_logical();
++                let opening = crate::shell::layer_animation::opening(
++                    popup.wl_surface(),
++                    local_geometry.to_f64(),
++                    crate::shell::layer_animation::popup_below(output, &layer, local_geometry),
++                );
++
+                 push_render_elements_from_surface_tree(
+                     renderer,
+                     popup.wl_surface(),
+@@ -872,18 +918,22 @@ where
+                         .to_local(output)
+                         .as_logical()
+                         .to_physical_precise_round(scale),
+-                    geometry.to_local(output).as_logical().to_f64(),
++                    local_geometry.to_f64(),
+                     Scale::from(scale),
+-                    1.0,
++                    opening.map_or(1.0, |(alpha, _, _)| alpha),
+                     false,
+                     radii,
+                     None,
+                     blur_strength,
+                     FRAME_TIME_FILTER,
+                     &mut |elem| {
++                        let elem = NamespacedElement::new(elem, namespace).into();
+                         elements.extend(
+-                            crop_to_output(NamespacedElement::new(elem, namespace).into())
+-                                .map(Into::into),
++                            match opening {
++                                Some((_, by, origin)) => crop_to_output_scaled(elem, origin, by),
++                                None => crop_to_output(elem),
++                            }
++                            .map(Into::into),
+                         )
+                     },
+                     None,
+@@ -913,6 +963,12 @@ where
+                     .map(|id| id.namespace_for_workspace(workspace_idx))
+                     .unwrap_or(workspace_idx);
+ 
++                let opening = crate::shell::layer_animation::opening(
++                    layer.wl_surface(),
++                    padded.to_f64(),
++                    true,
++                );
++
+                 push_render_elements_from_surface_tree(
+                     renderer,
+                     layer.wl_surface(),
+@@ -922,16 +978,20 @@ where
+                         .to_physical_precise_round(scale),
+                     geometry.to_f64(),
+                     Scale::from(scale),
+-                    1.0,
++                    opening.map_or(1.0, |(alpha, _, _)| alpha),
+                     false,
+                     radii,
+                     padded.to_f64(),
+                     blur_strength,
+                     FRAME_TIME_FILTER,
+                     &mut |elem| {
++                        let elem = NamespacedElement::new(elem, namespace).into();
+                         elements.extend(
+-                            crop_to_output(NamespacedElement::new(elem, namespace).into())
+-                                .map(Into::into),
++                            match opening {
++                                Some((_, by, origin)) => crop_to_output_scaled(elem, origin, by),
++                                None => crop_to_output(elem),
++                            }
++                            .map(Into::into),
+                         )
+                     },
+                     None,
+@@ -979,7 +1039,7 @@ where
+                     }
+                     OverviewMode::Active(_) => 0.6,
+                     OverviewMode::None => 1.0,
+-                };
++                } * windows_alpha;
+ 
+                 layout.render_popups(renderer, alpha, scanout_node, &mut |elem| {
+                     if let Some(elem) = crop_to_output(elem.into()) {
+@@ -1004,7 +1064,7 @@ where
+                     }
+                     OverviewMode::Active(_) => 0.6,
+                     OverviewMode::None => 1.0,
+-                };
++                } * windows_alpha;
+ 
+                 let current_focus = (!move_active && is_active_space)
+                     .then_some(last_active_seat)
+@@ -1273,7 +1333,9 @@ where
+     let zoom_state = shell_ref.zoom_state().cloned();
+     std::mem::drop(shell_ref);
+ 
+-    let element_filter = if workspace_overview_is_open(output) {
++    let element_filter = if workspace_overview_is_open(output)
++        && !crate::shell::layer_animation::overview_opening(output)
++    {
+         ElementFilter::LayerShellOnly
+     } else {
+         ElementFilter::All
+diff --git a/src/shell/layout/tiling/mod.rs b/src/shell/layout/tiling/mod.rs
+index 8706dc5..97cdc8f 100644
+--- a/src/shell/layout/tiling/mod.rs
++++ b/src/shell/layout/tiling/mod.rs
+@@ -5452,6 +5452,9 @@ fn render_new_tree_windows<R>(
+         );
+     }
+ 
++    // fading out under the workspaces overview
++    let windows_alpha = crate::shell::layer_animation::windows_alpha(output);
++
+     // render actual tree nodes
+     render_new_tree(
+         target_tree,
+@@ -5462,6 +5465,7 @@ fn render_new_tree_windows<R>(
+         swap_tree,
+         swap_desc.as_ref(),
+         |node_id, data, geo, original_geo, alpha, animating| {
++            let alpha = alpha * windows_alpha;
+             if swap_desc.as_ref().map(|desc| &desc.node) == Some(&node_id)
+                 || focused.as_ref() == Some(&node_id)
+             {
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 535e06d..5a43857 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -94,6 +94,7 @@ use crate::{
+ };
+ 
+ pub mod close_animation;
++pub mod layer_animation;
+ pub mod element;
+ pub mod focus;
+ pub mod grabs;
+@@ -2311,6 +2312,7 @@ impl Shell {
+             .workspaces
+             .spaces()
+             .any(|workspace| workspace.animations_going())
++            || self.outputs().any(layer_animation::animating)
+             || self.zoom_state.as_ref().is_some_and(|_| {
+                 self.outputs().any(|o| {
+                     o.user_data()
+@@ -2333,6 +2335,9 @@ impl Shell {
+         for workspace in self.workspaces.spaces_mut() {
+             clients.extend(workspace.update_animations());
+         }
++        for output in self.outputs() {
++            layer_animation::update(output);
++        }
+         clients
+     }
+ 
+@@ -3065,6 +3070,7 @@ impl Shell {
+             let mut map = layer_map_for_output(&pending.output);
+             map.map_layer(&pending.surface).unwrap();
+         }
++        layer_animation::layer_mapped(&pending.surface);
+         for workspace in self.workspaces.spaces_mut() {
+             workspace.tiling_layer.recalculate();
+         }
+diff --git a/src/shell/workspace.rs b/src/shell/workspace.rs
+index 5da3e1e..e2bcaa2 100644
+--- a/src/shell/workspace.rs
++++ b/src/shell/workspace.rs
+@@ -1692,6 +1692,7 @@ impl Workspace {
+                     }
+                     (None, None) => (fullscreen_geo, 1.0),
+                 };
++                let alpha = alpha * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+                 let render_loc = target_geo
+                     .loc
+@@ -1775,7 +1776,7 @@ impl Workspace {
+                 }
+                 OverviewMode::Active(_) => 0.6,
+                 OverviewMode::None => 1.0,
+-            };
++            } * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+             // closed windows, over the others
+             for closing in self.closing_windows.iter().rev() {
+@@ -1969,7 +1970,7 @@ impl Workspace {
+                 }
+                 OverviewMode::Active(_) => 0.6,
+                 OverviewMode::None => 1.0,
+-            };
++            } * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+             self.floating_layer
+                 .render_popups(renderer, alpha, scanout_node, &mut |elem| push(elem.into()));
+diff --git a/src/wayland/handlers/layer_shell.rs b/src/wayland/handlers/layer_shell.rs
+index 9653557..8ebc6f9 100644
+--- a/src/wayland/handlers/layer_shell.rs
++++ b/src/wayland/handlers/layer_shell.rs
+@@ -39,6 +39,7 @@ impl WlrLayerShellHandler for State {
+     }
+ 
+     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
++        crate::shell::layer_animation::popup_created(popup.wl_surface());
+         self.common
+             .shell
+             .read()
+@@ -55,6 +56,15 @@ impl WlrLayerShellHandler for State {
+     }
+ 
+     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
++        let closing = self.common.shell.read().outputs().find_map(|o| {
++            let map = layer_map_for_output(o);
++            map.layer_for_surface(surface.wl_surface(), WindowSurfaceType::TOPLEVEL)
++                .map(|layer| (o.clone(), layer.clone()))
++        });
++        if let Some((output, layer)) = closing {
++            crate::shell::layer_animation::picture_closing_layer(self, &output, &layer);
++        }
++
+         let mut shell = self.common.shell.write();
+         let maybe_output = shell
+             .outputs()
+diff --git a/src/wayland/handlers/xdg_shell/mod.rs b/src/wayland/handlers/xdg_shell/mod.rs
+index 0013e75..cc876fe 100644
+--- a/src/wayland/handlers/xdg_shell/mod.rs
++++ b/src/wayland/handlers/xdg_shell/mod.rs
+@@ -332,6 +332,10 @@ impl XdgShellHandler for State {
+         }
+     }
+ 
++    fn popup_destroyed(&mut self, surface: PopupSurface) {
++        crate::shell::layer_animation::picture_closing_popup(self, surface.wl_surface());
++    }
++
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+         crate::shell::close_animation::picture_closing_window(self, surface.wl_surface());
+ 
+diff --git a/src/shell/layer_animation.rs b/src/shell/layer_animation.rs
+new file mode 100644
+index 0000000..d02309e
+--- /dev/null
++++ b/src/shell/layer_animation.rs
+@@ -0,0 +1,520 @@
++//! The shell's layer surfaces open and close like GNOME's: the app library
++//! and the launcher fade in growing into place, the workspaces overview fades
++//! in settling from a little bigger while the windows fade out under it, and
++//! the panel's popups do the same, faster. They close the other way. The
++//! client takes the surface with it, so what it last showed is kept as a
++//! picture, read back from the GPU right before it goes, as for windows.
++
++use std::{
++    sync::{Mutex, OnceLock},
++    time::{Duration, Instant},
++};
++
++use anyhow::Context;
++use keyframe::{EasingFunction, functions::EaseOutQuad};
++use smithay::{
++    backend::{
++        allocator::Fourcc,
++        renderer::{
++            Offscreen,
++            damage::OutputDamageTracker,
++            element::{
++                Kind, RenderElement,
++                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
++            },
++            gles::GlesRenderbuffer,
++            utils::with_renderer_surface_state,
++        },
++    },
++    desktop::{LayerSurface, PopupManager, layer_map_for_output},
++    output::Output,
++    reexports::wayland_server::protocol::wl_surface::WlSurface,
++    utils::{Logical, Point, Rectangle, Scale, Size, Transform},
++    wayland::compositor::with_states,
++};
++use tracing::warn;
++
++use crate::{
++    backend::render::{
++        RendererRef,
++        element::AsGlowRenderer,
++        wayland::{SurfaceRenderElement, push_render_elements_from_surface_tree},
++    },
++    state::{State, advertised_node_for_surface},
++    utils::quirks::{APP_LIBRARY_NAMESPACE, LAUNCHER_NAMESPACE, WORKSPACE_OVERVIEW_NAMESPACE},
++    wayland::handlers::{
++        compositor::FRAME_TIME_FILTER,
++        corner_radius::{pad_rect, surface_corners, surface_padding},
++    },
++};
++
++/// What a surface does opening and closing.
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Animation {
++    open: Duration,
++    close: Duration,
++    /// The size it opens from and closes to.
++    scale: f64,
++    /// Where it grows from, as a fraction of what it shows.
++    origin: (f64, f64),
++}
++
++// GNOME's overview: 250 ms, easing out.
++const OVERVIEW: Animation = Animation {
++    open: Duration::from_millis(250),
++    close: Duration::from_millis(250),
++    scale: 1.05,
++    origin: (0.5, 0.5),
++};
++const APP_LIBRARY: Animation = Animation {
++    open: Duration::from_millis(250),
++    close: Duration::from_millis(200),
++    scale: 0.9,
++    origin: (0.5, 0.5),
++};
++// From the top, where it is.
++const LAUNCHER: Animation = Animation {
++    open: Duration::from_millis(200),
++    close: Duration::from_millis(150),
++    scale: 0.9,
++    origin: (0.5, 0.0),
++};
++// GNOME's menus: 150 ms. Grows out of the panel's side; set when drawn.
++const POPUP: Animation = Animation {
++    open: Duration::from_millis(150),
++    close: Duration::from_millis(150),
++    scale: 0.9,
++    origin: (0.5, 0.0),
++};
++
++/// Margin kept around what a layer shows when picturing it, for its shadow.
++const PICTURE_MARGIN: i32 = 48;
++
++fn for_namespace(namespace: &str) -> Option<Animation> {
++    match namespace {
++        WORKSPACE_OVERVIEW_NAMESPACE => Some(OVERVIEW),
++        APP_LIBRARY_NAMESPACE => Some(APP_LIBRARY),
++        LAUNCHER_NAMESPACE => Some(LAUNCHER),
++        _ => None,
++    }
++}
++
++struct Opening {
++    animation: Animation,
++    /// From its first frame with something to show.
++    start: OnceLock<Instant>,
++}
++
++fn mark(surface: &WlSurface, animation: Animation) {
++    with_states(surface, |states| {
++        states.data_map.insert_if_missing_threadsafe(|| Opening {
++            animation,
++            start: OnceLock::new(),
++        });
++    });
++}
++
++/// Called as a layer surface maps.
++pub fn layer_mapped(layer: &LayerSurface) {
++    if let Some(animation) = for_namespace(layer.namespace()) {
++        mark(layer.wl_surface(), animation);
++    }
++}
++
++/// Called as a popup of a layer surface is made.
++pub fn popup_created(surface: &WlSurface) {
++    mark(surface, POPUP);
++}
++
++/// How far opening `surface` is, eased, if it is. Its clock starts once it
++/// has something to show.
++fn opening_progress(surface: &WlSurface) -> Option<(Animation, f64)> {
++    let has_buffer =
++        with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
++    with_states(surface, |states| {
++        let opening = states.data_map.get::<Opening>()?;
++        let start = if has_buffer {
++            *opening.start.get_or_init(Instant::now)
++        } else {
++            *opening.start.get()?
++        };
++        let linear = Instant::now().duration_since(start).as_secs_f64()
++            / opening.animation.open.as_secs_f64();
++        (linear < 1.0).then(|| (opening.animation, EaseOutQuad.y(linear)))
++    })
++}
++
++/// For drawing `surface`, whose visible part is `area`: its alpha, and the
++/// scale to draw it at around a point, while it opens.
++pub fn opening(
++    surface: &WlSurface,
++    area: Rectangle<f64, Logical>,
++    from_above: bool,
++) -> Option<(f32, f64, Point<f64, Logical>)> {
++    let (mut animation, progress) = opening_progress(surface)?;
++    if animation == POPUP && !from_above {
++        animation.origin.1 = 1.0;
++    }
++    let scale = animation.scale + (1.0 - animation.scale) * progress;
++    Some((progress as f32, scale, origin(&animation, area)))
++}
++
++fn origin(animation: &Animation, area: Rectangle<f64, Logical>) -> Point<f64, Logical> {
++    area.loc + Point::from((area.size.w * animation.origin.0, area.size.h * animation.origin.1))
++}
++
++fn overview_layers(output: &Output) -> Vec<LayerSurface> {
++    layer_map_for_output(output)
++        .layers()
++        .filter(|s| s.namespace() == WORKSPACE_OVERVIEW_NAMESPACE)
++        .cloned()
++        .collect()
++}
++
++/// Whether the overview is still opening on `output`: the windows are drawn,
++/// fading out, until it's done.
++pub fn overview_opening(output: &Output) -> bool {
++    overview_layers(output)
++        .iter()
++        .any(|layer| opening_progress(layer.wl_surface()).is_some())
++}
++
++/// The windows fade out as the overview opens, and back in as it closes.
++pub fn windows_alpha(output: &Output) -> f32 {
++    let opening = overview_layers(output)
++        .iter()
++        .filter_map(|layer| opening_progress(layer.wl_surface()))
++        .map(|(_, progress)| 1.0 - progress as f32)
++        .reduce(f32::min);
++    if let Some(alpha) = opening {
++        return alpha;
++    }
++    closing_layers(output)
++        .lock()
++        .unwrap()
++        .iter()
++        .filter(|closing| closing.animation == OVERVIEW)
++        .map(|closing| closing.progress() as f32)
++        .reduce(f32::min)
++        .unwrap_or(1.0)
++}
++
++/// Whether anything opens or closes on `output`.
++pub fn animating(output: &Output) -> bool {
++    if !closing_layers(output).lock().unwrap().is_empty() {
++        return true;
++    }
++    let layers = layer_map_for_output(output)
++        .layers()
++        .cloned()
++        .collect::<Vec<_>>();
++    layers.iter().any(|layer| {
++        opening_progress(layer.wl_surface()).is_some()
++            || PopupManager::popups_for_surface(layer.wl_surface())
++                .any(|(popup, _)| opening_progress(popup.wl_surface()).is_some())
++    })
++}
++
++/// Drops what's done closing; whether anything was.
++pub fn update(output: &Output) -> bool {
++    let mut closing = closing_layers(output).lock().unwrap();
++    let before = closing.len();
++    closing.retain(|closing| closing.progress() < 1.0);
++    closing.len() != before
++}
++
++#[derive(Default)]
++struct ClosingLayers(Mutex<Vec<ClosingLayer>>);
++
++fn closing_layers(output: &Output) -> &Mutex<Vec<ClosingLayer>> {
++    &output
++        .user_data()
++        .get_or_insert_threadsafe(ClosingLayers::default)
++        .0
++}
++
++#[derive(Debug)]
++pub struct ClosingLayer {
++    buffer: MemoryRenderBuffer,
++    /// Where the picture was on the output.
++    area: Rectangle<i32, Logical>,
++    /// The picture's size in pixels.
++    pixels: Size<i32, Logical>,
++    animation: Animation,
++    origin: Point<f64, Logical>,
++    start: Instant,
++}
++
++impl ClosingLayer {
++    fn progress(&self) -> f64 {
++        (Instant::now().duration_since(self.start).as_secs_f64()
++            / self.animation.close.as_secs_f64())
++        .min(1.0)
++    }
++
++    fn render_element<R>(
++        &self,
++        renderer: &mut R,
++        output_scale: f64,
++    ) -> Option<MemoryRenderBufferRenderElement<R>>
++    where
++        R: AsGlowRenderer,
++        R::TextureId: Send + Clone + 'static,
++    {
++        let progress = EaseOutQuad.y(self.progress());
++        let scale = 1.0 + (self.animation.scale - 1.0) * progress;
++        let area = self.area.to_f64();
++        let size = area.size.upscale(scale);
++        let loc = self.origin + (area.loc - self.origin).upscale(scale);
++
++        MemoryRenderBufferRenderElement::from_buffer(
++            renderer,
++            loc.to_physical(output_scale),
++            &self.buffer,
++            Some((1.0 - progress) as f32),
++            Some(Rectangle::from_size(self.pixels.to_f64())),
++            Some(size.to_i32_round()),
++            Kind::Unspecified,
++        )
++        .ok()
++    }
++}
++
++/// The closing surfaces on `output`, topmost first.
++pub fn closing_elements<R>(
++    renderer: &mut R,
++    output: &Output,
++) -> Vec<MemoryRenderBufferRenderElement<R>>
++where
++    R: AsGlowRenderer,
++    R::TextureId: Send + Clone + 'static,
++{
++    let scale = output.current_scale().fractional_scale();
++    closing_layers(output)
++        .lock()
++        .unwrap()
++        .iter()
++        .rev()
++        .filter_map(|closing| closing.render_element(renderer, scale))
++        .collect()
++}
++
++/// A picture of the surface tree of `surface`, whose origin is at `loc` and
++/// whose geometry is `geometry`, of `area` (all on the output) at `scale`.
++fn picture<R>(
++    renderer: &mut R,
++    surface: &WlSurface,
++    loc: Point<i32, Logical>,
++    geometry: Rectangle<i32, Logical>,
++    area: Rectangle<i32, Logical>,
++    scale: f64,
++) -> anyhow::Result<(MemoryRenderBuffer, Size<i32, Logical>)>
++where
++    R: AsGlowRenderer,
++    R::TextureId: Send + Clone + 'static,
++    R::Error: Send + Sync + 'static,
++    SurfaceRenderElement<R>: RenderElement<R>,
++{
++    let size = area.size.to_physical_precise_round(scale);
++    anyhow::ensure!(size.w > 0 && size.h > 0, "nothing to picture");
++
++    let radii = with_states(surface, |states| surface_corners(states, geometry.size))
++        .unwrap_or([0; 4]);
++    let mut elements = Vec::new();
++    push_render_elements_from_surface_tree(
++        renderer,
++        surface,
++        (loc - area.loc).to_physical_precise_round(scale),
++        Rectangle::new(geometry.loc - area.loc, geometry.size).to_f64(),
++        Scale::from(scale),
++        1.0,
++        false,
++        radii,
++        None,
++        0,
++        FRAME_TIME_FILTER,
++        &mut |elem| elements.push(elem),
++        None,
++    );
++    anyhow::ensure!(!elements.is_empty(), "nothing to picture");
++
++    let format = Fourcc::Abgr8888;
++    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
++    let mut render_buffer =
++        Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
++    let mut fb = renderer.bind(&mut render_buffer)?;
++    let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
++    damage_tracker
++        .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
++        .map_err(|err| match err {
++            smithay::backend::renderer::damage::Error::Rendering(err) => err,
++            smithay::backend::renderer::damage::Error::OutputNoMode(_) => unreachable!(),
++        })?;
++    let mapping = renderer.copy_framebuffer(&fb, Rectangle::from_size(buffer_size), format)?;
++    let pixels = renderer.map_texture(&mapping)?;
++    let buffer =
++        MemoryRenderBuffer::from_slice(pixels, format, buffer_size, 1, Transform::Normal, None);
++    Ok((buffer, size.to_logical(1)))
++}
++
++struct Target {
++    surface: WlSurface,
++    output: Output,
++    loc: Point<i32, Logical>,
++    geometry: Rectangle<i32, Logical>,
++    area: Rectangle<i32, Logical>,
++    animation: Animation,
++    origin: Point<f64, Logical>,
++}
++
++fn keep_picture(state: &mut State, target: Target) {
++    let scale = target.output.current_scale().fractional_scale();
++    let dh = state.common.display_handle.clone();
++    let picture = state
++        .backend
++        .offscreen_renderer(|kms| {
++            advertised_node_for_surface(&target.surface, &dh)
++                .or(*kms.primary_node.read().unwrap())
++        })
++        .context("No renderer to picture the closing surface")
++        .and_then(|renderer| match renderer {
++            RendererRef::Glow(renderer) => picture(
++                renderer,
++                &target.surface,
++                target.loc,
++                target.geometry,
++                target.area,
++                scale,
++            ),
++            RendererRef::GlMulti(mut renderer) => picture(
++                &mut renderer,
++                &target.surface,
++                target.loc,
++                target.geometry,
++                target.area,
++                scale,
++            ),
++        });
++
++    match picture {
++        Ok((buffer, pixels)) => {
++            closing_layers(&target.output)
++                .lock()
++                .unwrap()
++                .push(ClosingLayer {
++                    buffer,
++                    area: target.area,
++                    pixels,
++                    animation: target.animation,
++                    origin: target.origin,
++                    start: Instant::now(),
++                });
++            state.backend.schedule_render(&target.output);
++        }
++        Err(err) => warn!(?err, "Failed to picture the closing surface"),
++    }
++}
++
++/// Keeps a picture of `layer` on `output` to close, if it animates; called
++/// right before unmapping it.
++pub fn picture_closing_layer(state: &mut State, output: &Output, layer: &LayerSurface) {
++    let Some(animation) = for_namespace(layer.namespace()) else {
++        return;
++    };
++    // Only one that was showing.
++    if !with_renderer_surface_state(layer.wl_surface(), |state| state.buffer().is_some())
++        .unwrap_or(false)
++    {
++        return;
++    }
++    let Some(layer_geometry) = layer_map_for_output(output).layer_geometry(layer) else {
++        return;
++    };
++    let loc = layer_geometry.loc;
++    let mut geometry = layer.geometry();
++    geometry.loc += loc;
++    let shown = with_states(layer.wl_surface(), |states| {
++        surface_padding(states).and_then(|padding| pad_rect(geometry, &padding))
++    })
++    .unwrap_or(geometry);
++    let area = if shown == geometry {
++        geometry
++    } else {
++        let mut area = shown;
++        area.loc -= Point::from((PICTURE_MARGIN, PICTURE_MARGIN));
++        area.size += Size::from((PICTURE_MARGIN * 2, PICTURE_MARGIN * 2));
++        area.intersection(geometry).unwrap_or(shown)
++    };
++
++    keep_picture(
++        state,
++        Target {
++            surface: layer.wl_surface().clone(),
++            output: output.clone(),
++            loc,
++            geometry,
++            area,
++            animation,
++            origin: origin(&animation, shown.to_f64()),
++        },
++    );
++}
++
++/// Keeps a picture of the popup `surface` to close, if it's of a layer
++/// surface; called as it's destroyed.
++pub fn picture_closing_popup(state: &mut State, surface: &WlSurface) {
++    let found = {
++        let shell = state.common.shell.read();
++        shell.outputs().find_map(|output| {
++            let map = layer_map_for_output(output);
++            map.layers().find_map(|layer| {
++                let layer_geometry = map.layer_geometry(layer)?;
++                PopupManager::popups_for_surface(layer.wl_surface()).find_map(
++                    |(popup, offset)| {
++                        (popup.wl_surface() == surface).then(|| {
++                            let loc = layer_geometry.loc + offset - popup.geometry().loc;
++                            let mut geometry = popup.geometry();
++                            geometry.loc += loc;
++                            let below = geometry.loc.y as f64 + geometry.size.h as f64 / 2.0
++                                >= layer_geometry.loc.y as f64
++                                    + layer_geometry.size.h as f64 / 2.0;
++                            (output.clone(), loc, geometry, below)
++                        })
++                    },
++                )
++            })
++        })
++    };
++    let Some((output, loc, geometry, below)) = found else {
++        return;
++    };
++    if !with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false) {
++        return;
++    }
++    let mut animation = POPUP;
++    if !below {
++        animation.origin.1 = 1.0;
++    }
++    keep_picture(
++        state,
++        Target {
++            surface: surface.clone(),
++            output,
++            loc,
++            geometry,
++            area: geometry,
++            animation,
++            origin: origin(&animation, geometry.to_f64()),
++        },
++    );
++}
++
++/// Whether the popup at `geometry` is below the layer surface it's of, on
++/// `output`: it grows down from it then, else up.
++pub fn popup_below(output: &Output, layer: &LayerSurface, geometry: Rectangle<i32, Logical>) -> bool {
++    let Some(layer_geometry) = layer_map_for_output(output).layer_geometry(layer) else {
++        return true;
++    };
++    geometry.loc.y as f64 + geometry.size.h as f64 / 2.0
++        >= layer_geometry.loc.y as f64 + layer_geometry.size.h as f64 / 2.0
++}

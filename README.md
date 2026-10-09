@@ -45,10 +45,15 @@ Como no GNOME (os tempos e as curvas são os do `gnome-shell`):
 | Minimizar e restaurar | 320 ms, curva simétrica | 400 ms, rápido no começo e devagar no fim |
 | Maximizar e encaixar | 200 ms, curva simétrica | 250 ms, desacelerando |
 | Trocar de espaço pelo teclado | 200 ms, curva simétrica | 250 ms, desacelerando |
+| Biblioteca de apps | aparece e some de uma vez | cresce do centro e aparece aos poucos (250 ms); ao fechar, encolhe e some (200 ms) |
+| Iniciador | aparece e some de uma vez | cresce de cima e aparece aos poucos (200 ms); ao fechar, o contrário (150 ms) |
+| Visão geral (espaços de trabalho) | aparece e some de uma vez, e as janelas somem junto | assenta, de um pouco maior, e aparece aos poucos enquanto as janelas somem por baixo (250 ms); ao fechar, o contrário |
+| Popups dos applets do painel | aparecem e somem de uma vez | crescem a partir do painel e aparecem aos poucos (150 ms); ao fechar, o contrário |
 
 Abrir vale para janelas flutuantes (o padrão do COSMIC); no modo lado a lado as janelas
 continuam entrando como antes. Para fechar, o compositor guarda uma imagem da janela no
-momento em que o app a fecha e é ela que some.
+momento em que o app a fecha e é ela que some; o mesmo vale para a biblioteca de apps,
+o iniciador, a visão geral e os popups, que os apps destroem ao fechar.
 
 ## Instalar
 
@@ -93,7 +98,9 @@ then app library, app library, launcher, go back, run a command), scripts to bui
 install and restore it, and an app to set the gestures. Another patch makes window
 animations GNOME's: windows open growing from their bottom middle and close shrinking
 and fading, and minimizing, maximizing and switching workspaces use GNOME's timing and
-curves.
+curves. A third one animates the shell's layers like GNOME's: the app library,
+the launcher, the workspaces overview (the windows fading out under it) and the
+panel's popups fade in growing into place, and close the other way.
 
 ## Licença
 
