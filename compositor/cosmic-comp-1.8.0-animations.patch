@@ -1,0 +1,640 @@
+diff --git a/src/shell/close_animation.rs b/src/shell/close_animation.rs
+new file mode 100644
+index 0000000..b578893
+--- /dev/null
++++ b/src/shell/close_animation.rs
+@@ -0,0 +1,209 @@
++//! Closing windows shrink a little and fade out, like GNOME's. The client
++//! takes the window's contents with it, so what it last showed is kept as a
++//! picture, read back from the GPU right before the window goes.
++
++use std::time::{Duration, Instant};
++
++use anyhow::Context;
++use keyframe::{EasingFunction, functions::EaseOutQuad};
++use smithay::{
++    backend::{
++        allocator::Fourcc,
++        renderer::{
++            Offscreen,
++            damage::OutputDamageTracker,
++            element::{
++                Kind, RenderElement,
++                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
++            },
++            gles::GlesRenderbuffer,
++        },
++    },
++    desktop::space::SpaceElement,
++    reexports::wayland_server::protocol::wl_surface::WlSurface,
++    utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform},
++};
++use tracing::warn;
++
++use crate::{
++    backend::render::{RendererRef, element::AsGlowRenderer},
++    shell::element::{CosmicMapped, CosmicMappedRenderElement},
++    state::{State, advertised_node_for_surface},
++    utils::{iced::IcedRenderElement, prelude::*},
++    wayland::protocols::workspace::WorkspaceHandle,
++};
++
++// GNOME's: 150 ms, down to 80% of the size.
++pub const CLOSE_ANIMATION_DURATION: Duration = Duration::from_millis(150);
++const CLOSE_SCALE: f64 = 0.8;
++
++#[derive(Debug)]
++pub struct ClosingWindow {
++    buffer: MemoryRenderBuffer,
++    /// Where the picture was in the workspace: the window and what its client
++    /// draws around it, like shadows.
++    area: Rectangle<i32, Logical>,
++    /// The picture's size in pixels.
++    pixels: Size<i32, Logical>,
++    start: Instant,
++}
++
++impl ClosingWindow {
++    /// A picture of `mapped`, whose window is at `geometry` in its workspace,
++    /// at the output's `scale`.
++    fn new<R>(
++        renderer: &mut R,
++        mapped: &CosmicMapped,
++        geometry: Rectangle<i32, Local>,
++        scale: f64,
++    ) -> anyhow::Result<Self>
++    where
++        R: AsGlowRenderer,
++        R::TextureId: Send + Clone + 'static,
++        R::Error: Send + Sync + 'static,
++        CosmicMappedRenderElement<R>: RenderElement<R>,
++    {
++        let bbox = SpaceElement::bbox(mapped);
++        let area = Rectangle::new(
++            geometry.loc.as_logical() - mapped.geometry().loc + bbox.loc,
++            bbox.size,
++        );
++        let size = bbox.size.to_physical_precise_round(scale);
++        anyhow::ensure!(size.w > 0 && size.h > 0, "nothing to picture");
++
++        let origin: Point<i32, Physical> = bbox.loc.to_physical_precise_round(scale);
++        let mut elements = Vec::new();
++        let mut below = Vec::new();
++        mapped.push_render_elements(
++            renderer,
++            Point::from((-origin.x, -origin.y)),
++            None,
++            Scale::from(scale),
++            1.0,
++            None,
++            None,
++            &mut |elem| elements.push(elem),
++            &mut |elem| below.push(elem),
++        );
++        elements.extend(below);
++
++        let format = Fourcc::Abgr8888;
++        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
++        let mut render_buffer =
++            Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
++        let mut fb = renderer.bind(&mut render_buffer)?;
++        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
++        damage_tracker
++            .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
++            .map_err(|err| match err {
++                smithay::backend::renderer::damage::Error::Rendering(err) => err,
++                smithay::backend::renderer::damage::Error::OutputNoMode(_) => unreachable!(),
++            })?;
++        let mapping =
++            renderer.copy_framebuffer(&fb, Rectangle::from_size(buffer_size), format)?;
++        let pixels = renderer.map_texture(&mapping)?;
++        let buffer =
++            MemoryRenderBuffer::from_slice(pixels, format, buffer_size, 1, Transform::Normal, None);
++
++        Ok(ClosingWindow {
++            buffer,
++            area,
++            pixels: size.to_logical(1),
++            start: Instant::now(),
++        })
++    }
++
++    pub fn is_animating(&self) -> bool {
++        Instant::now().duration_since(self.start) < CLOSE_ANIMATION_DURATION
++    }
++
++    pub fn render_element<R>(
++        &self,
++        renderer: &mut R,
++        output_scale: f64,
++        alpha: f32,
++    ) -> Option<CosmicMappedRenderElement<R>>
++    where
++        R: AsGlowRenderer,
++        R::TextureId: Send + Clone + 'static,
++        CosmicMappedRenderElement<R>: RenderElement<R>,
++    {
++        let linear = (Instant::now().duration_since(self.start).as_secs_f64()
++            / CLOSE_ANIMATION_DURATION.as_secs_f64())
++        .min(1.0);
++        let progress = EaseOutQuad.y(linear);
++        let scale = 1.0 - (1.0 - CLOSE_SCALE) * progress;
++
++        // Shrinks toward its middle.
++        let size = self.area.size.to_f64().upscale(scale);
++        let loc = self.area.loc.to_f64()
++            + Point::from((
++                (self.area.size.w as f64 - size.w) / 2.0,
++                (self.area.size.h as f64 - size.h) / 2.0,
++            ));
++
++        let elem = MemoryRenderBufferRenderElement::from_buffer(
++            renderer,
++            loc.to_physical(output_scale),
++            &self.buffer,
++            Some(alpha * (1.0 - progress) as f32),
++            // all of it, scaled to `size`
++            Some(Rectangle::from_size(self.pixels.to_f64())),
++            Some(size.to_i32_round()),
++            Kind::Unspecified,
++        )
++        .ok()?;
++        Some(IcedRenderElement::UI(elem).into())
++    }
++}
++
++/// Keeps a picture of the window `surface` is, to fade out once it's gone.
++/// For a shown window alone in its element (in a stack, another one takes
++/// its place); called right before unmapping it.
++pub fn picture_closing_window(state: &mut State, surface: &WlSurface) {
++    let found: Option<(WorkspaceHandle, CosmicMapped, Rectangle<i32, Local>, f64)> = {
++        let shell = state.common.shell.read();
++        shell.workspaces.spaces().find_map(|workspace| {
++            let mapped = workspace
++                .floating_layer
++                .mapped()
++                .chain(workspace.tiling_layer.mapped().map(|(m, _)| m))
++                .find(|m| m.windows().any(|(w, _)| &w == surface))?;
++            if mapped.windows().count() > 1
++                || shell.active_space(&workspace.output)?.handle != workspace.handle
++            {
++                return None;
++            }
++            let geometry = workspace.element_geometry(mapped)?;
++            let scale = workspace.output.current_scale().fractional_scale();
++            Some((workspace.handle, mapped.clone(), geometry, scale))
++        })
++    };
++    let Some((handle, mapped, geometry, scale)) = found else {
++        return;
++    };
++
++    let dh = state.common.display_handle.clone();
++    let closing = state
++        .backend
++        .offscreen_renderer(|kms| {
++            advertised_node_for_surface(surface, &dh).or(*kms.primary_node.read().unwrap())
++        })
++        .context("No renderer to picture the closing window")
++        .and_then(|renderer| match renderer {
++            RendererRef::Glow(renderer) => ClosingWindow::new(renderer, &mapped, geometry, scale),
++            RendererRef::GlMulti(mut renderer) => {
++                ClosingWindow::new(&mut renderer, &mapped, geometry, scale)
++            }
++        });
++
++    match closing {
++        Ok(closing) => {
++            let mut shell = state.common.shell.write();
++            if let Some(workspace) = shell.workspaces.space_for_handle_mut(&handle) {
++                workspace.closing_windows.push(closing);
++            }
++        }
++        Err(err) => warn!(?err, "Failed to picture the closing window"),
++    }
++}
+diff --git a/src/shell/focus/order.rs b/src/shell/focus/order.rs
+index fb904c0..6b9582e 100644
+--- a/src/shell/focus/order.rs
++++ b/src/shell/focus/order.rs
+@@ -1,7 +1,7 @@
+ use std::{ops::ControlFlow, time::Instant};
+ 
+ use cosmic_comp_config::workspace::WorkspaceLayout;
+-use keyframe::{ease, functions::EaseInOutCubic};
++use keyframe::{ease, functions::EaseOutCubic};
+ use smithay::{
+     desktop::{LayerSurface, PopupKind, PopupManager, layer_map_for_output},
+     output::{Output, OutputNoMode},
+@@ -13,9 +13,9 @@ use smithay::{
+ use crate::{
+     backend::render::ElementFilter,
+     shell::{
+-        SeatExt, Shell, Workspace, WorkspaceDelta,
++        SeatExt, Shell, WORKSPACE_ANIMATION_DURATION, Workspace, WorkspaceDelta,
+         focus::target::KeyboardFocusTarget,
+-        layout::{floating::FloatingLayout, tiling::ANIMATION_DURATION},
++        layout::floating::FloatingLayout,
+     },
+     utils::{
+         geometry::*,
+@@ -157,11 +157,11 @@ fn render_input_order_internal<R: 'static>(
+                 WorkspaceDelta::Shortcut(st) => (
+                     *previous_idx < current.1,
+                     ease(
+-                        EaseInOutCubic,
++                        EaseOutCubic,
+                         0.0,
+                         1.0,
+                         Instant::now().duration_since(*st).as_millis() as f32
+-                            / ANIMATION_DURATION.as_millis() as f32,
++                            / WORKSPACE_ANIMATION_DURATION.as_millis() as f32,
+                     ),
+                 ),
+                 WorkspaceDelta::Gesture {
+diff --git a/src/shell/layout/floating/mod.rs b/src/shell/layout/floating/mod.rs
+index 95d7264..457eb56 100644
+--- a/src/shell/layout/floating/mod.rs
++++ b/src/shell/layout/floating/mod.rs
+@@ -8,7 +8,7 @@ use std::{
+ 
+ use cosmic_comp_config::AppearanceConfig;
+ use cosmic_settings_config::shortcuts::action::ResizeDirection;
+-use keyframe::{ease, functions::EaseInOutCubic};
++use keyframe::{EasingFunction, ease, functions::{EaseOutQuad, Linear}};
+ use smallvec::SmallVec;
+ use smithay::{
+     backend::{
+@@ -42,15 +42,17 @@ use crate::{
+         grabs::{GrabStartData, ReleaseMode, ResizeEdge},
+     },
+     state::State,
+-    utils::{prelude::*, tween::EaseRectangle},
++    utils::{prelude::*, tween::{EaseOutExpo, EaseRectangle}},
+     wayland::handlers::xdg_shell::popup::get_popup_toplevel,
+ };
+ 
+ mod grabs;
+ pub use self::grabs::*;
+ 
+-pub const ANIMATION_DURATION: Duration = Duration::from_millis(200);
+-pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(320);
++// GNOME's: moving and resizing windows, minimizing, and opening them.
++pub const ANIMATION_DURATION: Duration = Duration::from_millis(250);
++pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(400);
++pub const OPEN_ANIMATION_DURATION: Duration = Duration::from_millis(150);
+ 
+ #[derive(Debug, Default)]
+ pub struct FloatingLayout {
+@@ -80,6 +82,11 @@ enum Animation {
+         previous_geometry: Rectangle<i32, Local>,
+         target_geometry: Rectangle<i32, Local>,
+     },
++    /// A new window, growing from the middle of its bottom edge and fading in.
++    Open {
++        start: Instant,
++        geometry: Rectangle<i32, Local>,
++    },
+ }
+ 
+ impl Animation {
+@@ -88,28 +95,39 @@ impl Animation {
+             Animation::Tiled { start, .. } => start,
+             Animation::Minimize { start, .. } => start,
+             Animation::Unminimize { start, .. } => start,
++            Animation::Open { start, .. } => start,
+         }
+     }
+ 
+-    fn alpha(&self) -> f32 {
++    fn duration(&self) -> Duration {
+         match self {
+-            Animation::Tiled { .. } => 1.0,
+-            Animation::Minimize { start, .. } => {
+-                let percentage = Instant::now()
+-                    .duration_since(*start)
+-                    .min(MINIMIZE_ANIMATION_DURATION)
+-                    .as_secs_f32()
+-                    / MINIMIZE_ANIMATION_DURATION.as_secs_f32();
+-                1.0 - ((percentage - 0.5).max(0.0) * 2.0)
+-            }
+-            Animation::Unminimize { start, .. } => {
+-                let percentage = Instant::now()
+-                    .duration_since(*start)
+-                    .min(MINIMIZE_ANIMATION_DURATION)
+-                    .as_secs_f32()
+-                    / MINIMIZE_ANIMATION_DURATION.as_secs_f32();
+-                (percentage * 2.0).min(1.0)
++            Animation::Tiled { .. } => ANIMATION_DURATION,
++            Animation::Minimize { .. } | Animation::Unminimize { .. } => {
++                MINIMIZE_ANIMATION_DURATION
+             }
++            Animation::Open { .. } => OPEN_ANIMATION_DURATION,
++        }
++    }
++
++    /// How far along it is, 0 to 1, eased like GNOME's.
++    fn progress(&self) -> f64 {
++        let duration = self.duration();
++        let linear = Instant::now()
++            .duration_since(*self.start())
++            .min(duration)
++            .as_secs_f64()
++            / duration.as_secs_f64();
++        match self {
++            Animation::Tiled { .. } => EaseOutQuad.y(linear),
++            _ => EaseOutExpo.y(linear),
++        }
++    }
++
++    fn alpha(&self) -> f32 {
++        match self {
++            Animation::Tiled { .. } | Animation::Unminimize { .. } => 1.0,
++            Animation::Minimize { .. } => 1.0 - self.progress() as f32,
++            Animation::Open { .. } => self.progress() as f32,
+         }
+     }
+ 
+@@ -124,6 +142,7 @@ impl Animation {
+             Animation::Unminimize {
+                 previous_geometry, ..
+             } => previous_geometry,
++            Animation::Open { geometry, .. } => geometry,
+         }
+     }
+ 
+@@ -134,35 +153,44 @@ impl Animation {
+         tiled_state: Option<&TiledCorners>,
+         gaps: (i32, i32),
+     ) -> Rectangle<i32, Local> {
+-        let (duration, target_rect) = match self {
++        let target_rect = match self {
+             Animation::Minimize {
+                 target_geometry, ..
+             }
+             | Animation::Unminimize {
+                 target_geometry, ..
+-            } => (MINIMIZE_ANIMATION_DURATION, *target_geometry),
++            } => *target_geometry,
+             Animation::Tiled { .. } => {
+-                let target_geometry = if let Some(target_rect) =
++                if let Some(target_rect) =
+                     tiled_state.map(|state| state.relative_geometry(output_geometry, gaps))
+                 {
+                     target_rect
+                 } else {
+                     current_geometry
+-                };
+-                (ANIMATION_DURATION, target_geometry)
++                }
++            }
++            Animation::Open { geometry, .. } => {
++                // GNOME's: from 1% wide and 5% high, held at the bottom middle.
++                let progress = self.progress();
++                let w = (geometry.size.w as f64 * (0.01 + 0.99 * progress)).round() as i32;
++                let h = (geometry.size.h as f64 * (0.05 + 0.95 * progress)).round() as i32;
++                let (w, h) = (w.max(1), h.max(1));
++                return Rectangle::new(
++                    (
++                        geometry.loc.x + (geometry.size.w - w) / 2,
++                        geometry.loc.y + geometry.size.h - h,
++                    )
++                        .into(),
++                    (w, h).into(),
++                );
+             }
+         };
+-        let previous_rect = *self.previous_geometry();
+-        let start = *self.start();
+-        let now = Instant::now();
+-        let progress =
+-            now.duration_since(start).min(duration).as_secs_f64() / duration.as_secs_f64();
+ 
+         ease(
+-            EaseInOutCubic,
+-            EaseRectangle(previous_rect),
++            Linear,
++            EaseRectangle(*self.previous_geometry()),
+             EaseRectangle(target_rect),
+-            progress,
++            self.progress(),
+         )
+         .unwrap()
+     }
+@@ -380,6 +408,12 @@ impl FloatingLayout {
+                         *target_geometry = geometry;
+                     }
+                     Animation::Minimize { .. } | Animation::Tiled { .. } => {}
++                    Animation::Open { .. } => {
++                        *existing_anim = Animation::Tiled {
++                            start: Instant::now(),
++                            previous_geometry,
++                        };
++                    }
+                 }
+             } else {
+                 self.animations.insert(
+@@ -621,6 +655,22 @@ impl FloatingLayout {
+         self.space.refresh();
+     }
+ 
++    /// Opens a window just mapped like GNOME does.
++    pub fn animate_open(&mut self, mapped: &CosmicMapped) {
++        if self.animations.contains_key(mapped) {
++            return;
++        }
++        if let Some(geometry) = self.space.element_geometry(mapped) {
++            self.animations.insert(
++                mapped.clone(),
++                Animation::Open {
++                    start: Instant::now(),
++                    geometry: geometry.as_local(),
++                },
++            );
++        }
++    }
++
+     pub fn remap_minimized(
+         &mut self,
+         mapped: CosmicMapped,
+@@ -1414,13 +1464,8 @@ impl FloatingLayout {
+ 
+     pub fn update_animation_state(&mut self) {
+         let was_empty = self.animations.is_empty();
+-        self.animations.retain(|_, anim| {
+-            let duration = match anim {
+-                Animation::Tiled { .. } => ANIMATION_DURATION,
+-                _ => MINIMIZE_ANIMATION_DURATION,
+-            };
+-            Instant::now().duration_since(*anim.start()) < duration
+-        });
++        self.animations
++            .retain(|_, anim| Instant::now().duration_since(*anim.start()) < anim.duration());
+         if self.animations.is_empty() != was_empty {
+             self.dirty.store(true, Ordering::SeqCst);
+         }
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 47d7885..535e06d 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -93,6 +93,7 @@ use crate::{
+     },
+ };
+ 
++pub mod close_animation;
+ pub mod element;
+ pub mod focus;
+ pub mod grabs;
+@@ -122,6 +123,8 @@ use self::{
+ };
+ 
+ const ANIMATION_DURATION: Duration = Duration::from_millis(200);
++/// Switching workspaces with a shortcut, as long as GNOME's.
++pub const WORKSPACE_ANIMATION_DURATION: Duration = Duration::from_millis(250);
+ const GESTURE_MAX_LENGTH: f64 = 150.0;
+ const GESTURE_POSITION_THRESHOLD: f64 = 0.5;
+ const GESTURE_VELOCITY_THRESHOLD: f64 = 0.02;
+@@ -599,7 +602,7 @@ impl WorkspaceSet {
+             match start {
+                 WorkspaceDelta::Shortcut(st) => {
+                     if Instant::now().duration_since(st).as_millis() as f32
+-                        >= ANIMATION_DURATION.as_millis() as f32
++                        >= WORKSPACE_ANIMATION_DURATION.as_millis() as f32
+                     {
+                         self.previously_active = None;
+                     }
+@@ -2998,6 +3001,10 @@ impl Shell {
+ 
+         if should_be_minimized {
+             self.minimize_request(&window);
++        } else if !should_be_sticky
++            && let Some(workspace) = self.workspaces.space_for_handle_mut(&workspace_handle)
++        {
++            workspace.floating_layer.animate_open(&mapped);
+         }
+ 
+         let new_target = if should_be_minimized {
+diff --git a/src/shell/workspace.rs b/src/shell/workspace.rs
+index 84a020f..5da3e1e 100644
+--- a/src/shell/workspace.rs
++++ b/src/shell/workspace.rs
+@@ -6,6 +6,7 @@ use crate::{
+     backend::render::{BackdropShader, element::AsGlowRenderer},
+     shell::{
+         ANIMATION_DURATION, OverviewMode, SeatMoveGrabState,
++        close_animation::ClosingWindow,
+         layout::{
+             floating::{FloatingLayout, TiledCorners},
+             tiling::TilingLayout,
+@@ -108,6 +109,8 @@ pub struct Workspace {
+     pub minimized_windows: Vec<MinimizedWindow>,
+     pub tiling_enabled: bool,
+     pub fullscreen_surfaces: Vec<FullscreenSurface>,
++    /// Windows closed, still fading out.
++    pub closing_windows: Vec<ClosingWindow>,
+     pub pinned: bool,
+     pub id: Option<String>,
+     pub name: Option<String>,
+@@ -399,6 +402,7 @@ impl Workspace {
+             tiling_enabled,
+             minimized_windows: Vec::new(),
+             fullscreen_surfaces: Vec::new(),
++            closing_windows: Vec::new(),
+             pinned: false,
+             id: None,
+             name: None,
+@@ -433,6 +437,7 @@ impl Workspace {
+             tiling_enabled: pinned.tiling_enabled,
+             minimized_windows: Vec::new(),
+             fullscreen_surfaces: Vec::new(),
++            closing_windows: Vec::new(),
+             pinned: true,
+             id: pinned.id.clone(),
+             name: pinned.name.clone(),
+@@ -538,6 +543,7 @@ impl Workspace {
+         self.tiling_layer.animations_going()
+             || self.floating_layer.animations_going()
+             || self.fullscreen_surfaces.iter().any(|f| f.is_animating())
++            || !self.closing_windows.is_empty()
+             || self.dirty.swap(false, Ordering::SeqCst)
+     }
+ 
+@@ -562,6 +568,12 @@ impl Workspace {
+             true
+         });
+ 
++        let closing = self.closing_windows.len();
++        self.closing_windows.retain(ClosingWindow::is_animating);
++        if self.closing_windows.len() != closing {
++            self.dirty.store(true, Ordering::SeqCst);
++        }
++
+         let clients = self.tiling_layer.update_animation_state();
+         self.floating_layer.update_animation_state();
+         clients
+@@ -1765,6 +1777,13 @@ impl Workspace {
+                 OverviewMode::None => 1.0,
+             };
+ 
++            // closed windows, over the others
++            for closing in self.closing_windows.iter().rev() {
++                if let Some(elem) = closing.render_element(renderer, output_scale, alpha) {
++                    push(elem.into());
++                }
++            }
++
+             self.floating_layer.render(
+                 renderer,
+                 focused.as_ref().and_then(|target| {
+diff --git a/src/utils/tween.rs b/src/utils/tween.rs
+index 490fa3e..6950c44 100644
+--- a/src/utils/tween.rs
++++ b/src/utils/tween.rs
+@@ -45,3 +45,17 @@ impl<N: Coordinate, Kind> EaseRectangle<N, Kind> {
+         self.0
+     }
+ }
++
++/// Clutter's `EASE_OUT_EXPO`, which GNOME opens and minimizes windows with.
++#[derive(Copy, Clone, Debug, Default)]
++pub struct EaseOutExpo;
++
++impl keyframe::EasingFunction for EaseOutExpo {
++    fn y(&self, x: f64) -> f64 {
++        if x >= 1.0 {
++            1.0
++        } else {
++            1.0 - 2f64.powf(-10.0 * x)
++        }
++    }
++}
+diff --git a/src/wayland/handlers/xdg_shell/mod.rs b/src/wayland/handlers/xdg_shell/mod.rs
+index be7084d..0013e75 100644
+--- a/src/wayland/handlers/xdg_shell/mod.rs
++++ b/src/wayland/handlers/xdg_shell/mod.rs
+@@ -333,6 +333,8 @@ impl XdgShellHandler for State {
+     }
+ 
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
++        crate::shell::close_animation::picture_closing_window(self, surface.wl_surface());
++
+         for (popup, _) in smithay::desktop::PopupManager::popups_for_surface(surface.wl_surface()) {
+             if let smithay::desktop::PopupKind::Xdg(ref xdg_popup) = popup {
+                 xdg_popup.send_popup_done();
+diff --git a/src/xwayland.rs b/src/xwayland.rs
+index cc6be3b..ca6c4e5 100644
+--- a/src/xwayland.rs
++++ b/src/xwayland.rs
+@@ -881,6 +881,12 @@ impl XwmHandler for State {
+     }
+ 
+     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
++        if !window.is_override_redirect()
++            && let Some(wl_surface) = window.wl_surface()
++        {
++            crate::shell::close_animation::picture_closing_window(self, &wl_surface);
++        }
++
+         let mut shell = self.common.shell.write();
+         if window.is_override_redirect() {
+             shell.override_redirect_windows.retain(|or| or != &window);

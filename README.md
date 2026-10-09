@@ -6,7 +6,8 @@ O COSMIC 1.8 só troca de espaço de trabalho com quatro dedos para os lados; tr
 não fazem nada (nem chegam aos apps), e não há como configurar. Isto são duas partes:
 
 - **`compositor/`**: um patch para o `cosmic-comp` que lê os gestos de uma configuração
-  e os faz, com scripts para compilar, instalar e voltar ao original;
+  e os faz, e outro que deixa as animações das janelas como as do GNOME, com scripts
+  para compilar, instalar e voltar ao original;
 - **o app "Gestos do touchpad"**: escolhe o que cada gesto faz, e mostra se o compositor
   em uso tem o patch.
 
@@ -33,6 +34,22 @@ As ações que abrem algo esperam os dedos andarem um pouco (60 px), para um toq
 abrir nada. A visão geral do COSMIC é um programa à parte (`cosmic-workspaces`): ela abre
 quando o gesto passa desse ponto, sem crescer junto com os dedos como no GNOME.
 
+## Animações
+
+Como no GNOME (os tempos e as curvas são os do `gnome-shell`):
+
+| | COSMIC 1.8 | Com o patch |
+| --- | --- | --- |
+| Abrir janela | aparece de uma vez | cresce do meio da borda de baixo e aparece aos poucos (150 ms) |
+| Fechar janela | some de uma vez | encolhe um pouco e some aos poucos (150 ms) |
+| Minimizar e restaurar | 320 ms, curva simétrica | 400 ms, rápido no começo e devagar no fim |
+| Maximizar e encaixar | 200 ms, curva simétrica | 250 ms, desacelerando |
+| Trocar de espaço pelo teclado | 200 ms, curva simétrica | 250 ms, desacelerando |
+
+Abrir vale para janelas flutuantes (o padrão do COSMIC); no modo lado a lado as janelas
+continuam entrando como antes. Para fechar, o compositor guarda uma imagem da janela no
+momento em que o app a fecha e é ela que some.
+
 ## Instalar
 
 O compositor (precisa de `sudo` para trocar o `/usr/bin/cosmic-comp`, e de Rust e das
@@ -42,7 +59,7 @@ bibliotecas de desenvolvimento do `cosmic-comp`):
 compositor/install.sh
 ```
 
-Ele baixa o `cosmic-comp` da mesma versão do sistema, aplica o patch, compila, guarda o
+Ele baixa o `cosmic-comp` da mesma versão do sistema, aplica os patches, compila, guarda o
 original como `cosmic-comp.orig` e põe o novo no lugar. Saia da sessão e entre de novo.
 
 Se a sessão não abrir: Ctrl+Alt+F3, entre, e rode `sudo mv /usr/bin/cosmic-comp.orig
@@ -73,7 +90,10 @@ usam os mesmos comandos dos atalhos de teclado (`Super+W`, `Super+A`…).
 GNOME's touchpad gestures for COSMIC: a patch for `cosmic-comp` 1.8.0 that reads which
 three- and four-finger swipes do what (switch workspace following the fingers, overview
 then app library, app library, launcher, go back, run a command), scripts to build,
-install and restore it, and an app to set the gestures.
+install and restore it, and an app to set the gestures. Another patch makes window
+animations GNOME's: windows open growing from their bottom middle and close shrinking
+and fading, and minimizing, maximizing and switching workspaces use GNOME's timing and
+curves.
 
 ## Licença
 
