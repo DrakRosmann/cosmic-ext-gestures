@@ -1,0 +1,116 @@
+diff --git a/src/backend/wayland/buffer.rs b/src/backend/wayland/buffer.rs
+index 431b1e4..4777877 100644
+--- a/src/backend/wayland/buffer.rs
++++ b/src/backend/wayland/buffer.rs
+@@ -21,6 +21,10 @@ pub struct Buffer {
+     pub mmap: memmap2::Mmap,
+ }
+ 
++/// Marks this build as patched, for the scripts that install it.
++#[used]
++static PATCHED: [u8; 36] = *b"io.github.DrakRosmann.CosmicGestures";
++
+ impl AppData {
+     fn create_shm_buffer(&self, format: wl_shm::Format, (width, height): (u32, u32)) -> Buffer {
+         let fd = utils::create_memfile().unwrap(); // XXX?
+@@ -88,18 +92,9 @@ impl AppData {
+             return Ok(None);
+         };
+         let drm_dev = drm_dev.unwrap_or(feedback.main_device());
+-        if let Some(vulkan) = &mut self.vulkan
+-            && let Ok(Some(name)) = vulkan.device_name(drm_dev)
+-        {
+-            // TODO Workaround: force shm on Meteor/Arrow/Lunar/Tiger Lake
+-            if name.contains("TGL")
+-                || name.contains("MTL")
+-                || name.contains("ARL")
+-                || name.contains("LNL")
+-            {
+-                return Ok(None);
+-            }
+-        }
++        // Copied with the GPU on Intel Tiger/Meteor/Arrow/Lunar Lake too: through
++        // shm, every frame is read back and copied by the compositor, and the
++        // overview runs at about 20 fps.
+         let Some((_dev_path, gbm)) = self.gbm_devices.gbm_device(drm_dev)? else {
+             return Ok(None);
+         };
+diff --git a/src/main.rs b/src/main.rs
+index 4ba8e05..f4d863e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -120,6 +120,7 @@ enum Msg {
+     ActionOnTyping(String),
+     Ignore,
+     Rectangle(RectangleUpdate<RectId>),
++    DropImages,
+ }
+ 
+ #[derive(Clone, Debug)]
+@@ -353,14 +354,17 @@ impl App {
+         self.action_on_typing_activated = false;
+ 
+         self.visible = false;
+-        self.update_capture_filter();
++        self.send_capture_filter();
+         self.drag_surface = None;
++        // The pictures go once the surfaces have: the compositor animates
++        // their last frame closing, which should still show them.
+         Task::batch(
+             self.layer_surfaces
+                 .keys()
+                 .copied()
+                 .map(destroy_layer_surface),
+         )
++        .chain(Task::done(cosmic::Action::App(Msg::DropImages)))
+     }
+ 
+     fn send_wayland_cmd(&self, cmd: backend::Cmd) {
+@@ -370,6 +374,11 @@ impl App {
+     }
+ 
+     fn update_capture_filter(&mut self) {
++        self.send_capture_filter();
++        self.drop_images();
++    }
++
++    fn send_capture_filter(&mut self) {
+         let mut capture_filter = backend::CaptureFilter::default();
+         if self.visible {
+             capture_filter.workspaces_on_outputs =
+@@ -382,7 +391,12 @@ impl App {
+                 .map(|x| x.handle().clone())
+                 .collect();
+         }
++        self.capture_filter = capture_filter.clone();
++        self.send_wayland_cmd(backend::Cmd::CaptureFilter(capture_filter));
++    }
+ 
++    fn drop_images(&mut self) {
++        let capture_filter = &self.capture_filter;
+         // Drop `CaptureImage` for workspaces and toplevels not matching new
+         // filter.
+         for workspace in &mut self.workspaces.0 {
+@@ -395,9 +409,6 @@ impl App {
+                 toplevel.img = None;
+             }
+         }
+-
+-        self.capture_filter = capture_filter.clone();
+-        self.send_wayland_cmd(backend::Cmd::CaptureFilter(capture_filter));
+     }
+ 
+     fn panel_regions(&self, output_handle: &wl_output::WlOutput) -> iced::Padding {
+@@ -1049,6 +1060,12 @@ impl Application for App {
+                 self.action_on_typing_activated = true;
+             }
+             Msg::Ignore => {}
++            Msg::DropImages => {
++                // unless it was shown again meanwhile
++                if !self.visible {
++                    self.drop_images();
++                }
++            }
+         }
+ 
+         Task::none()

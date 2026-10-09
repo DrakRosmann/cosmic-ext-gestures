@@ -1,0 +1,724 @@
+diff --git a/src/wayland/handlers/image_copy_capture/mod.rs b/src/wayland/handlers/image_copy_capture/mod.rs
+index 85a01c9..053afdd 100644
+--- a/src/wayland/handlers/image_copy_capture/mod.rs
++++ b/src/wayland/handlers/image_copy_capture/mod.rs
+@@ -1,6 +1,14 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-use std::{borrow::Borrow, collections::HashMap, sync::Mutex};
++use std::{
++    borrow::Borrow,
++    cell::{Cell, RefCell},
++    collections::HashMap,
++    sync::Mutex,
++    time::Duration,
++};
++
++use calloop::timer::{TimeoutAction, Timer};
+ 
+ use smithay::{
+     backend::{
+@@ -16,7 +24,10 @@ use smithay::{
+     desktop::space::SpaceElement,
+     input::{Seat, pointer::PointerHandle},
+     output::Output,
+-    reexports::wayland_server::protocol::{wl_pointer::WlPointer, wl_shm::Format as ShmFormat},
++    reexports::wayland_server::{
++        Resource,
++        protocol::{wl_pointer::WlPointer, wl_shm::Format as ShmFormat},
++    },
+     utils::{Buffer as BufferCoords, Point, Size, Transform},
+     wayland::{
+         dmabuf::get_dmabuf,
+@@ -298,14 +309,18 @@ impl ImageCopyCaptureHandler for State {
+                 self.backend.schedule_render(&output);
+             }
+             ImageCaptureSourceKind::Workspace(handle) => {
+-                render_workspace_to_buffer(self, session, frame, handle)
++                if let Some(frame) = render_workspace_to_buffer(self, session, frame, handle) {
++                    wait_for_change(self, session.clone(), frame);
++                }
+             }
+             ImageCaptureSourceKind::Toplevel(toplevel) => {
+                 let Some(toplevel) = toplevel.upgrade() else {
+                     return;
+                 };
+ 
+-                render_window_to_buffer(self, session, frame, &toplevel)
++                if let Some(frame) = render_window_to_buffer(self, session, frame, &toplevel) {
++                    wait_for_change(self, session.clone(), frame);
++                }
+             }
+             ImageCaptureSourceKind::Destroyed => {
+                 frame.fail(CaptureFailureReason::Stopped);
+@@ -327,6 +342,7 @@ impl ImageCopyCaptureHandler for State {
+     }
+ 
+     fn frame_aborted(&mut self, frame: FrameRef) {
++        WAITING.with_borrow_mut(|waiting| waiting.retain(|(_, f)| *f != frame));
+         let shell = self.common.shell.read();
+         for mut output in shell.outputs().cloned() {
+             output.remove_frame(&frame);
+@@ -334,6 +350,7 @@ impl ImageCopyCaptureHandler for State {
+     }
+ 
+     fn session_destroyed(&mut self, session: SessionRef) {
++        WAITING.with_borrow_mut(|waiting| waiting.retain(|(s, _)| *s != session));
+         match ImageCaptureSourceKind::from_source(&session.source()) {
+             ImageCaptureSourceKind::Output(weak) => {
+                 if let Some(mut output) = weak.upgrade() {
+@@ -388,6 +405,49 @@ impl ImageCopyCaptureHandler for State {
+     }
+ }
+ 
++thread_local! {
++    /// Frames of workspaces and windows that haven't changed since they were
++    /// last captured, waiting until they do.
++    static WAITING: RefCell<Vec<(SessionRef, Frame)>> = const { RefCell::new(Vec::new()) };
++    static RETRYING: Cell<bool> = const { Cell::new(false) };
++}
++
++/// How often waiting frames look for a change: as often as a screen updates.
++const RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
++
++/// Holds `frame` of `session` until its source changes, looking again every
++/// frame. Copying a workspace or window as soon as it's asked, changed or not,
++/// had the overview redraw them all the time.
++fn wait_for_change(state: &mut State, session: SessionRef, frame: Frame) {
++    WAITING.with_borrow_mut(|waiting| waiting.push((session, frame)));
++    if RETRYING.replace(true) {
++        return;
++    }
++    let retry = state.common.event_loop_handle.insert_source(
++        Timer::from_duration(RETRY_INTERVAL),
++        |_, _, state| {
++            for (session, frame) in WAITING.take() {
++                // the client may have let go of the buffer meanwhile
++                if frame.has_failed() || !frame.buffer().is_alive() {
++                    continue;
++                }
++                state.frame(&session, frame);
++            }
++            if WAITING.with_borrow(Vec::is_empty) {
++                RETRYING.set(false);
++                TimeoutAction::Drop
++            } else {
++                TimeoutAction::ToDuration(RETRY_INTERVAL)
++            }
++        },
++    );
++    if let Err(err) = retry {
++        tracing::warn!(?err, "Failed to wait for a capture's source to change");
++        RETRYING.set(false);
++        WAITING.take();
++    }
++}
++
+ fn constraints_for_output(output: &Output, backend: &mut BackendData) -> Option<BufferConstraints> {
+     let mode = match output.current_mode() {
+         Some(mode) => mode.size.to_logical(1).to_buffer(1, Transform::Normal),
+diff --git a/src/wayland/handlers/image_copy_capture/render.rs b/src/wayland/handlers/image_copy_capture/render.rs
+index f8b308e..d30ab87 100644
+--- a/src/wayland/handlers/image_copy_capture/render.rs
++++ b/src/wayland/handlers/image_copy_capture/render.rs
+@@ -32,20 +32,20 @@ use smithay::{
+         shm::{shm_format_to_fourcc, with_buffer_contents, with_buffer_contents_mut},
+     },
+ };
+-use std::time::{Duration, SystemTime, UNIX_EPOCH};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ use tracing::warn;
+ 
+ use crate::{
+     backend::render::{
+-        CursorMode, ElementFilter, RendererRef,
++        CLEAR_COLOR, CursorMode, ElementFilter, RendererRef,
+         cursor::{self, CursorRenderElement},
+         element::{AsGlowRenderer, CosmicElement, DamageElement},
+-        render_workspace,
+         wayland::SurfaceRenderElement,
++        workspace_elements,
+     },
+     shell::{CosmicMappedRenderElement, CosmicSurface, WorkspaceRenderElement},
+     state::{Common, KmsNodes, State},
+-    utils::prelude::{PointExt, PointGlobalExt, RectExt, RectLocalExt, SeatExt},
++    utils::prelude::{OutputExt, PointExt, PointGlobalExt, RectExt, RectGlobalExt, RectLocalExt, SeatExt},
+     wayland::{
+         handlers::image_copy_capture::{
+             SessionData, SessionUserData, constraints_for_output, constraints_for_toplevel,
+@@ -268,7 +268,7 @@ where
+         session_user_data.offscreen = None;
+     }
+ 
+-    let SessionUserData { dt, offscreen } = &mut *session_user_data;
++    let SessionUserData { dt, offscreen, .. } = &mut *session_user_data;
+     let mut fb = offscreen
+         .as_mut()
+         .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
+@@ -294,15 +294,158 @@ where
+     .map_err(DTError::Rendering)
+ }
+ 
++/// What capturing a workspace or a window did.
++pub enum Captured {
++    /// Copied; ready once the GPU is done.
++    Copied(Option<PendingImageCopyData>),
++    /// Nothing changed since the last capture: the frame waits until something does.
++    Unchanged(Frame),
++}
++
++/// What a workspace or window capture rendered, if its source changed: the
++/// rendering, what changed and the buffers it read.
++type ChangedRender<'d> = Option<(
++    RenderOutputResult<'d>,
++    Vec<Rectangle<i32, Physical>>,
++    Vec<smithay::backend::renderer::utils::Buffer>,
++)>;
++
++/// Like [`render_session`], for workspaces and windows, which are copied when
++/// the client asks rather than as an output is drawn: it reports what changed
++/// in the source since the last capture (not what the client asked to have
++/// redrawn in its buffer too, which it then asks for again, and so on, every
++/// frame), and holds the frame while nothing did.
++pub fn render_changed<F, R>(
++    renderer: &mut R,
++    session: &SessionData,
++    frame: Frame,
++    transform: Transform,
++    render_fn: F,
++) -> Result<Captured, DTError<R::Error>>
++where
++    R: AsGlowRenderer,
++    F: for<'d> FnOnce(
++        &WlBuffer,
++        &mut R,
++        Option<&mut R::Framebuffer<'_>>,
++        &'d mut OutputDamageTracker,
++        &mut OutputDamageTracker,
++        usize,
++        Vec<Rectangle<i32, BufferCoords>>,
++    ) -> Result<ChangedRender<'d>, DTError<R::Error>>,
++{
++    let mut session_user_data = session.lock().unwrap();
++
++    // At most so often: they're shown small, and copying a busy window and its
++    // workspace every frame takes the GPU from what's being animated. And one at
++    // a time: several in the same frame made the screen miss it.
++    if session_user_data
++        .copied
++        .is_some_and(|copied| copied.elapsed() < MIN_COPY_INTERVAL)
++        || LAST_COPY.get().is_some_and(|last| last.elapsed() < MIN_COPY_SPACING)
++    {
++        return Ok(Captured::Unchanged(frame));
++    }
++
++    let buffer = frame.buffer();
++
++    let mut age = 1;
++    if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
++        let size = buffer_dimensions(&buffer).ok_or(DTError::OutputNoMode(OutputNoMode))?;
++        let format = with_buffer_contents(&buffer, |_, _, data| {
++            shm_format_to_fourcc(data.format)
++                .expect("We should be able to convert all hardcoded shm screencopy formats")
++        })
++        .map_err(|_| DTError::OutputNoMode(OutputNoMode))?;
++
++        session_user_data
++            .offscreen
++            .take_if(|(context_id, renderbuffer)| {
++                renderer.glow_renderer().context_id() != *context_id
++                    || renderbuffer.size() != size
++                    || renderbuffer.format() != Some(format)
++            });
++
++        if session_user_data.offscreen.is_none() {
++            let renderbuffer = Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, size)
++                .map_err(DTError::Rendering)?;
++            session_user_data.offscreen =
++                Some((renderer.glow_renderer().context_id(), renderbuffer));
++            age = 0;
++        }
++    } else {
++        session_user_data.offscreen = None;
++    }
++
++    let SessionUserData {
++        dt,
++        content,
++        copied,
++        offscreen,
++    } = &mut *session_user_data;
++    let mut fb = offscreen
++        .as_mut()
++        .map(|(_, tex)| renderer.bind(tex).map_err(DTError::Rendering))
++        .transpose()?;
++    let Some((result, changed, buffers)) = render_fn(
++        &frame.buffer(),
++        renderer,
++        fb.as_mut(),
++        dt,
++        content,
++        age,
++        frame.damage(),
++    )?
++    else {
++        return Ok(Captured::Unchanged(frame));
++    };
++    *copied = Some(Instant::now());
++    LAST_COPY.set(*copied);
++
++    submit_buffer(
++        frame,
++        renderer,
++        fb.as_mut(),
++        transform,
++        Some(&changed),
++        result.sync,
++        buffers,
++    )
++    .map(Captured::Copied)
++    .map_err(DTError::Rendering)
++}
++
++/// How often a workspace or window is copied at most: 30 times a second (the
++/// frames that wait are looked at again every 1/60 s).
++const MIN_COPY_INTERVAL: Duration = Duration::from_millis(30);
++/// Between any two copies: one per look, every 1/60 s.
++const MIN_COPY_SPACING: Duration = Duration::from_millis(12);
++
++thread_local! {
++    static LAST_COPY: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
++}
++
++/// What changed in `elements` since the last capture, if anything.
++fn changed<E: smithay::backend::renderer::element::Element>(
++    content: &mut OutputDamageTracker,
++    elements: &[E],
++) -> Result<Option<Vec<Rectangle<i32, Physical>>>, OutputNoMode> {
++    Ok(content
++        .damage_output(1, elements)?
++        .0
++        .filter(|damage| !damage.is_empty())
++        .cloned())
++}
++
+ pub fn render_workspace_to_buffer(
+     state: &mut State,
+     session: &SessionRef,
+     frame: Frame,
+     handle: WorkspaceHandle,
+-) {
++) -> Option<Frame> {
+     let shell = state.common.shell.read();
+     let Some(workspace) = shell.workspaces.space_for_handle(&handle) else {
+-        return;
++        return None;
+     };
+ 
+     let mut output = workspace.output().clone();
+@@ -318,14 +461,14 @@ pub fn render_workspace_to_buffer(
+     if mode != Some(buffer_size) {
+         let Some(constraints) = constraints_for_output(&output, &mut state.backend) else {
+             output.remove_session(session);
+-            return;
++            return None;
+         };
+         session.update_constraints(constraints);
+         if let Some(data) = session.user_data().get::<SessionData>() {
+             *data.lock().unwrap() = SessionUserData::new(OutputDamageTracker::from_output(&output));
+         }
+         frame.fail(CaptureFailureReason::BufferConstraints);
+-        return;
++        return None;
+     }
+ 
+     fn render_fn<'d, R>(
+@@ -333,19 +476,14 @@ pub fn render_workspace_to_buffer(
+         renderer: &mut R,
+         offscreen: Option<&mut R::Framebuffer<'_>>,
+         dt: &'d mut OutputDamageTracker,
++        content: &mut OutputDamageTracker,
+         age: usize,
+         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
+         draw_cursor: bool,
+         common: &mut Common,
+         output: &Output,
+         handle: (WorkspaceHandle, usize),
+-    ) -> Result<
+-        (
+-            RenderOutputResult<'d>,
+-            Vec<smithay::backend::renderer::utils::Buffer>,
+-        ),
+-        DTError<R::Error>,
+-    >
++    ) -> Result<ChangedRender<'d>, DTError<R::Error>>
+     where
+         R: AsGlowRenderer,
+         R::TextureId: Send + Clone + 'static,
+@@ -370,63 +508,52 @@ pub fn render_workspace_to_buffer(
+                         .to_f64()
+                 }, /* TODO: Mode is Buffer..., why is this Physical in the first place */
+             )?;
+-        let additional_damage = (!additional_damage.is_empty()).then(|| {
++        let mut elements = workspace_elements(
++            None,
++            renderer,
++            &common.shell,
++            None,
++            common.clock.now(),
++            output,
++            None,
++            handle,
++            cursor_mode,
++            ElementFilter::ExcludeWorkspaceOverview,
++            None,
++        )?;
++        let Some(changed) = changed(content, &elements).map_err(DTError::OutputNoMode)? else {
++            return Ok(None);
++        };
++
++        // and what the client's buffer lacks, from the captures into its other buffers
++        let output_geo = output.geometry().to_local(output).as_logical();
++        let scale = output.current_scale().fractional_scale();
++        elements.splice(
++            0..0,
+             additional_damage
+                 .into_iter()
+-                .map(|rect| {
++                .filter_map(|rect| {
+                     rect.to_f64()
+-                        .to_logical(
+-                            output.current_scale().fractional_scale(),
+-                            output.current_transform(),
+-                            &area,
+-                        )
++                        .to_logical(scale, output.current_transform(), &area)
+                         .to_i32_round()
++                        .intersection(output_geo)
+                 })
+-                .collect()
+-        });
++                .map(DamageElement::new)
++                .map(CosmicElement::from),
++        );
+ 
+-        let (res, elements) = if let Ok(dmabuf) = get_dmabuf(buffer) {
++        let res = if let Ok(dmabuf) = get_dmabuf(buffer) {
+             let mut dmabuf = dmabuf.clone();
+             let mut fb = renderer.bind(&mut dmabuf).map_err(DTError::Rendering)?;
+-            render_workspace(
+-                None,
+-                renderer,
+-                &mut fb,
+-                dt,
+-                age,
+-                additional_damage,
+-                &common.shell,
+-                None,
+-                common.clock.now(),
+-                output,
+-                None,
+-                handle,
+-                cursor_mode,
+-                ElementFilter::ExcludeWorkspaceOverview,
+-            )?
++            dt.render_output(renderer, &mut fb, age, &elements, CLEAR_COLOR)?
+         } else {
+             let target = offscreen.expect("shm buffers should have an offscreen target");
+-            render_workspace(
+-                None,
+-                renderer,
+-                target,
+-                dt,
+-                age,
+-                additional_damage,
+-                &common.shell,
+-                None,
+-                common.clock.now(),
+-                output,
+-                None,
+-                handle,
+-                cursor_mode,
+-                ElementFilter::ExcludeWorkspaceOverview,
+-            )?
++            dt.render_output(renderer, target, age, &elements, CLEAR_COLOR)?
+         };
+ 
+         let buffers = render_element_buffers(renderer, &elements);
+ 
+-        Ok((res, buffers))
++        Ok(Some((res, changed, buffers)))
+     }
+ 
+     let draw_cursor = session.draw_cursor();
+@@ -461,22 +588,23 @@ pub fn render_workspace_to_buffer(
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+             frame.fail(CaptureFailureReason::Unknown);
+-            return;
++            return None;
+         }
+     };
+     let result = match renderer {
+         RendererRef::Glow(renderer) => {
+-            match render_session(
++            match render_changed(
+                 renderer,
+                 session.user_data().get::<SessionData>().unwrap(),
+                 frame,
+                 transform,
+-                |buffer, renderer, offscreen, dt, age, additional_damage| {
++                |buffer, renderer, offscreen, dt, content, age, additional_damage| {
+                     render_fn(
+                         buffer,
+                         renderer,
+                         offscreen,
+                         dt,
++                        content,
+                         age,
+                         additional_damage,
+                         draw_cursor,
+@@ -486,7 +614,8 @@ pub fn render_workspace_to_buffer(
+                     )
+                 },
+             ) {
+-                Ok(frame) => frame,
++                Ok(Captured::Copied(frame)) => frame,
++                Ok(Captured::Unchanged(frame)) => return Some(frame),
+                 Err(err) => {
+                     tracing::warn!(?err, "Failed to render to screencopy buffer");
+                     None
+@@ -494,17 +623,18 @@ pub fn render_workspace_to_buffer(
+             }
+         }
+         RendererRef::GlMulti(mut renderer) => {
+-            match render_session(
++            match render_changed(
+                 &mut renderer,
+                 session.user_data().get::<SessionData>().unwrap(),
+                 frame,
+                 transform,
+-                |buffer, renderer, offscreen, dt, age, additional_damage| {
++                |buffer, renderer, offscreen, dt, content, age, additional_damage| {
+                     render_fn(
+                         buffer,
+                         renderer,
+                         offscreen,
+                         dt,
++                        content,
+                         age,
+                         additional_damage,
+                         draw_cursor,
+@@ -514,7 +644,8 @@ pub fn render_workspace_to_buffer(
+                     )
+                 },
+             ) {
+-                Ok(frame) => frame,
++                Ok(Captured::Copied(frame)) => frame,
++                Ok(Captured::Unchanged(frame)) => return Some(frame),
+                 Err(err) => {
+                     tracing::warn!(?err, "Failed to render to screencopy buffer");
+                     None
+@@ -530,6 +661,7 @@ pub fn render_workspace_to_buffer(
+             common.clock.now(),
+         );
+     }
++    None
+ }
+ 
+ smithay::render_elements! {
+@@ -544,10 +676,10 @@ pub fn render_window_to_buffer(
+     session: &SessionRef,
+     frame: Frame,
+     toplevel: &CosmicSurface,
+-) {
++) -> Option<Frame> {
+     if !toplevel.alive() {
+         toplevel.clone().remove_session(session);
+-        return;
++        return None;
+     }
+ 
+     let buffer = frame.buffer();
+@@ -556,7 +688,7 @@ pub fn render_window_to_buffer(
+     if buffer_size != geometry.size.to_buffer(1, Transform::Normal) {
+         let Some(constraints) = constraints_for_toplevel(toplevel, &mut state.backend) else {
+             toplevel.clone().remove_session(session);
+-            return;
++            return None;
+         };
+         session.update_constraints(constraints);
+ 
+@@ -566,7 +698,7 @@ pub fn render_window_to_buffer(
+                 SessionUserData::new(OutputDamageTracker::new(size, 1.0, Transform::Normal));
+         }
+         frame.fail(CaptureFailureReason::BufferConstraints);
+-        return;
++        return None;
+     }
+ 
+     fn render_fn<'d, R>(
+@@ -574,26 +706,21 @@ pub fn render_window_to_buffer(
+         renderer: &mut R,
+         offscreen: Option<&mut R::Framebuffer<'_>>,
+         dt: &'d mut OutputDamageTracker,
++        content: &mut OutputDamageTracker,
+         age: usize,
+         additional_damage: Vec<Rectangle<i32, BufferCoords>>,
+         draw_cursor: bool,
+         common: &mut Common,
+         toplevel: &CosmicSurface,
+         geometry: Rectangle<i32, Logical>,
+-    ) -> Result<
+-        (
+-            RenderOutputResult<'d>,
+-            Vec<smithay::backend::renderer::utils::Buffer>,
+-        ),
+-        DTError<R::Error>,
+-    >
++    ) -> Result<ChangedRender<'d>, DTError<R::Error>>
+     where
+         R: AsGlowRenderer,
+         R::TextureId: Send + Clone + 'static,
+         CosmicElement<R>: RenderElement<R>,
+         CosmicMappedRenderElement<R>: RenderElement<R>,
+     {
+-        let mut elements: Vec<_> = additional_damage
++        let damage_elements: Vec<_> = additional_damage
+             .into_iter()
+             .filter_map(|rect| {
+                 let logical_rect = rect.to_logical(
+@@ -606,6 +733,7 @@ pub fn render_window_to_buffer(
+             .map(DamageElement::new)
+             .map(WindowCaptureElement::<R>::from)
+             .collect();
++        let mut elements = Vec::new();
+ 
+         let shell = common.shell.read();
+         let blur_strength = 9; // TODO
+@@ -692,6 +820,12 @@ pub fn render_window_to_buffer(
+             None,
+         );
+ 
++        let Some(changed) = changed(content, &elements).map_err(DTError::OutputNoMode)? else {
++            return Ok(None);
++        };
++        // and what the client's buffer lacks, from the captures into its other buffers
++        elements.splice(0..0, damage_elements);
++
+         let res = if let Ok(dmabuf) = get_dmabuf(buffer) {
+             let mut dmabuf_clone = dmabuf.clone();
+             let mut fb = renderer
+@@ -705,7 +839,7 @@ pub fn render_window_to_buffer(
+ 
+         let buffers = render_element_buffers(renderer, &elements);
+ 
+-        Ok((res, buffers))
++        Ok(Some((res, changed, buffers)))
+     }
+ 
+     let common = &mut state.common;
+@@ -733,21 +867,22 @@ pub fn render_window_to_buffer(
+         Err(err) => {
+             warn!(?err, "Couldn't use node for screencopy");
+             frame.fail(CaptureFailureReason::Unknown);
+-            return;
++            return None;
+         }
+     };
+     let result = match renderer {
+-        RendererRef::Glow(renderer) => match render_session(
++        RendererRef::Glow(renderer) => match render_changed(
+             renderer,
+             session.user_data().get::<SessionData>().unwrap(),
+             frame,
+             Transform::Normal,
+-            |buffer, renderer, offscreen, dt, age, additional_damage| {
++            |buffer, renderer, offscreen, dt, content, age, additional_damage| {
+                 render_fn(
+                     buffer,
+                     renderer,
+                     offscreen,
+                     dt,
++                    content,
+                     age,
+                     additional_damage,
+                     draw_cursor,
+@@ -757,23 +892,25 @@ pub fn render_window_to_buffer(
+                 )
+             },
+         ) {
+-            Ok(frame) => frame,
++            Ok(Captured::Copied(frame)) => frame,
++            Ok(Captured::Unchanged(frame)) => return Some(frame),
+             Err(err) => {
+                 tracing::warn!(?err, "Failed to render to screencopy buffer");
+                 None
+             }
+         },
+-        RendererRef::GlMulti(mut renderer) => match render_session(
++        RendererRef::GlMulti(mut renderer) => match render_changed(
+             &mut renderer,
+             session.user_data().get::<SessionData>().unwrap(),
+             frame,
+             Transform::Normal,
+-            |buffer, renderer, offscreen, dt, age, additional_damage| {
++            |buffer, renderer, offscreen, dt, content, age, additional_damage| {
+                 render_fn(
+                     buffer,
+                     renderer,
+                     offscreen,
+                     dt,
++                    content,
+                     age,
+                     additional_damage,
+                     draw_cursor,
+@@ -783,7 +920,8 @@ pub fn render_window_to_buffer(
+                 )
+             },
+         ) {
+-            Ok(frame) => frame,
++            Ok(Captured::Copied(frame)) => frame,
++            Ok(Captured::Unchanged(frame)) => return Some(frame),
+             Err(err) => {
+                 tracing::warn!(?err, "Failed to render to screencopy buffer");
+                 None
+@@ -798,6 +936,7 @@ pub fn render_window_to_buffer(
+             common.clock.now(),
+         );
+     }
++    None
+ }
+ 
+ pub fn render_cursor_to_buffer(
+diff --git a/src/wayland/handlers/image_copy_capture/user_data.rs b/src/wayland/handlers/image_copy_capture/user_data.rs
+index e9f3623..ff5a3ac 100644
+--- a/src/wayland/handlers/image_copy_capture/user_data.rs
++++ b/src/wayland/handlers/image_copy_capture/user_data.rs
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ 
+-use std::{cell::RefCell, sync::Mutex};
++use std::{cell::RefCell, sync::Mutex, time::Instant};
+ 
+ use smithay::{
+     backend::renderer::{
+@@ -23,12 +23,18 @@ pub type SessionData = Mutex<SessionUserData>;
+ 
+ pub struct SessionUserData {
+     pub dt: OutputDamageTracker,
++    /// What the source showed at the last capture, to tell what changed since.
++    pub content: OutputDamageTracker,
++    /// When it was last copied, for workspaces and windows.
++    pub copied: Option<Instant>,
+     pub offscreen: Option<(ContextId<GlesTexture>, GlesRenderbuffer)>,
+ }
+ 
+ impl SessionUserData {
+     pub fn new(tracker: OutputDamageTracker) -> SessionUserData {
+         SessionUserData {
++            content: OutputDamageTracker::from_mode_source(tracker.mode().clone()),
++            copied: None,
+             dt: tracker,
+             offscreen: None,
+         }

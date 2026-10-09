@@ -1,5 +1,5 @@
 diff --git a/src/backend/render/mod.rs b/src/backend/render/mod.rs
-index 9ad6158..311fb59 100644
+index 9ad6158..343f065 100644
 --- a/src/backend/render/mod.rs
 +++ b/src/backend/render/mod.rs
 @@ -683,7 +683,9 @@ where
@@ -13,7 +13,7 @@ index 9ad6158..311fb59 100644
          ElementFilter::LayerShellOnly
      } else {
          ElementFilter::All
-@@ -833,6 +835,43 @@ where
+@@ -833,6 +835,42 @@ where
          )
      };
  
@@ -47,9 +47,8 @@ index 9ad6158..311fb59 100644
 +
 +    // closing layers and popups, over everything
 +    if element_filter != ElementFilter::ExcludeWorkspaceOverview {
-+        for elem in crate::shell::layer_animation::closing_elements(renderer, output) {
-+            let elem = CosmicMappedRenderElement::from(crate::utils::iced::IcedRenderElement::UI(elem));
-+            elements.extend(crop_to_output(WorkspaceRenderElement::Window(elem)).map(Into::into));
++        for elem in crate::shell::layer_animation::closing_elements(renderer, output, blur_strength) {
++            elements.extend(crop_to_output(elem).map(Into::into));
 +        }
 +    }
 +    let windows_alpha = crate::shell::layer_animation::windows_alpha(output);
@@ -57,7 +56,7 @@ index 9ad6158..311fb59 100644
      render_input_order::<()>(&shell, output, previous, current, element_filter, |stage| {
          match stage {
              Stage::ZoomUI => {
-@@ -846,10 +885,10 @@ where
+@@ -846,10 +884,10 @@ where
                  })
              }
              Stage::LayerPopup {
@@ -69,7 +68,7 @@ index 9ad6158..311fb59 100644
              } => {
                  let mut geometry = popup.geometry().as_global();
                  geometry.loc += location;
-@@ -865,6 +904,13 @@ where
+@@ -865,6 +903,13 @@ where
                      .map(|id| id.namespace_for_workspace(workspace_idx))
                      .unwrap_or(workspace_idx);
  
@@ -83,7 +82,7 @@ index 9ad6158..311fb59 100644
                  push_render_elements_from_surface_tree(
                      renderer,
                      popup.wl_surface(),
-@@ -872,18 +918,22 @@ where
+@@ -872,18 +917,22 @@ where
                          .to_local(output)
                          .as_logical()
                          .to_physical_precise_round(scale),
@@ -110,7 +109,7 @@ index 9ad6158..311fb59 100644
                          )
                      },
                      None,
-@@ -913,6 +963,12 @@ where
+@@ -913,6 +962,12 @@ where
                      .map(|id| id.namespace_for_workspace(workspace_idx))
                      .unwrap_or(workspace_idx);
  
@@ -123,7 +122,7 @@ index 9ad6158..311fb59 100644
                  push_render_elements_from_surface_tree(
                      renderer,
                      layer.wl_surface(),
-@@ -922,16 +978,20 @@ where
+@@ -922,16 +977,20 @@ where
                          .to_physical_precise_round(scale),
                      geometry.to_f64(),
                      Scale::from(scale),
@@ -147,7 +146,7 @@ index 9ad6158..311fb59 100644
                          )
                      },
                      None,
-@@ -979,7 +1039,7 @@ where
+@@ -979,7 +1038,7 @@ where
                      }
                      OverviewMode::Active(_) => 0.6,
                      OverviewMode::None => 1.0,
@@ -156,7 +155,7 @@ index 9ad6158..311fb59 100644
  
                  layout.render_popups(renderer, alpha, scanout_node, &mut |elem| {
                      if let Some(elem) = crop_to_output(elem.into()) {
-@@ -1004,7 +1064,7 @@ where
+@@ -1004,7 +1063,7 @@ where
                      }
                      OverviewMode::Active(_) => 0.6,
                      OverviewMode::None => 1.0,
@@ -165,7 +164,7 @@ index 9ad6158..311fb59 100644
  
                  let current_focus = (!move_active && is_active_space)
                      .then_some(last_active_seat)
-@@ -1273,7 +1333,9 @@ where
+@@ -1273,7 +1332,9 @@ where
      let zoom_state = shell_ref.zoom_state().cloned();
      std::mem::drop(shell_ref);
  
@@ -176,145 +175,106 @@ index 9ad6158..311fb59 100644
          ElementFilter::LayerShellOnly
      } else {
          ElementFilter::All
-diff --git a/src/shell/layout/tiling/mod.rs b/src/shell/layout/tiling/mod.rs
-index 8706dc5..97cdc8f 100644
---- a/src/shell/layout/tiling/mod.rs
-+++ b/src/shell/layout/tiling/mod.rs
-@@ -5452,6 +5452,9 @@ fn render_new_tree_windows<R>(
-         );
+diff --git a/src/backend/render/wayland/blur_effect.rs b/src/backend/render/wayland/blur_effect.rs
+index b8a7935..704e3da 100644
+--- a/src/backend/render/wayland/blur_effect.rs
++++ b/src/backend/render/wayland/blur_effect.rs
+@@ -157,6 +157,8 @@ pub struct BlurElement {
+     offset: f64,
+     passes: usize,
+     uniforms: Vec<Uniform<'static>>,
++    /// Fading along with what it's behind.
++    alpha: f32,
+ }
+ 
+ impl BlurElement {
+@@ -167,6 +169,7 @@ impl BlurElement {
+         output_scale: f64,
+         radii: [u8; 4],
+         strength: usize,
++        alpha: f32,
+     ) -> Result<Option<Self>, R::Error> {
+         let region = vec![Rectangle::from_size(geometry.size.to_i32_round())];
+ 
+@@ -178,6 +181,7 @@ impl BlurElement {
+             output_scale,
+             radii,
+             strength,
++            alpha,
+         )
      }
  
-+    // fading out under the workspaces overview
-+    let windows_alpha = crate::shell::layer_animation::windows_alpha(output);
-+
-     // render actual tree nodes
-     render_new_tree(
-         target_tree,
-@@ -5462,6 +5465,7 @@ fn render_new_tree_windows<R>(
-         swap_tree,
-         swap_desc.as_ref(),
-         |node_id, data, geo, original_geo, alpha, animating| {
-+            let alpha = alpha * windows_alpha;
-             if swap_desc.as_ref().map(|desc| &desc.node) == Some(&node_id)
-                 || focused.as_ref() == Some(&node_id)
-             {
-diff --git a/src/shell/mod.rs b/src/shell/mod.rs
-index 535e06d..5a43857 100644
---- a/src/shell/mod.rs
-+++ b/src/shell/mod.rs
-@@ -94,6 +94,7 @@ use crate::{
- };
+@@ -188,6 +192,7 @@ impl BlurElement {
+         output_scale: f64,
+         radii: [u8; 4],
+         strength: usize,
++        alpha: f32,
+     ) -> Result<Option<Self>, R::Error> {
+         let mut blur_region_state = states.cached_state.get::<ComputedBlurRegionCachedState>();
+         let Some(region) = blur_region_state.current().blur_region.as_ref() else {
+@@ -206,6 +211,7 @@ impl BlurElement {
+             output_scale,
+             radii,
+             strength,
++            alpha,
+         )
+     }
  
- pub mod close_animation;
-+pub mod layer_animation;
- pub mod element;
- pub mod focus;
- pub mod grabs;
-@@ -2311,6 +2312,7 @@ impl Shell {
-             .workspaces
-             .spaces()
-             .any(|workspace| workspace.animations_going())
-+            || self.outputs().any(layer_animation::animating)
-             || self.zoom_state.as_ref().is_some_and(|_| {
-                 self.outputs().any(|o| {
-                     o.user_data()
-@@ -2333,6 +2335,9 @@ impl Shell {
-         for workspace in self.workspaces.spaces_mut() {
-             clients.extend(workspace.update_animations());
+@@ -217,8 +223,9 @@ impl BlurElement {
+         output_scale: f64,
+         radii: [u8; 4],
+         strength: usize,
++        alpha: f32,
+     ) -> Result<Option<Self>, R::Error> {
+-        if strength == 0 || geometry.size.w == 0. || geometry.size.h == 0. {
++        if strength == 0 || alpha <= 0.0 || geometry.size.w == 0. || geometry.size.h == 0. {
+             return Ok(None);
          }
-+        for output in self.outputs() {
-+            layer_animation::update(output);
-+        }
-         clients
+ 
+@@ -307,6 +314,7 @@ impl BlurElement {
+                 })
+                 .collect(),
+             uniforms,
++            alpha,
+         }))
+     }
+ }
+@@ -353,7 +361,7 @@ impl Element for BlurElement {
      }
  
-@@ -3065,6 +3070,7 @@ impl Shell {
-             let mut map = layer_map_for_output(&pending.output);
-             map.map_layer(&pending.surface).unwrap();
-         }
-+        layer_animation::layer_mapped(&pending.surface);
-         for workspace in self.workspaces.spaces_mut() {
-             workspace.tiling_layer.recalculate();
-         }
-diff --git a/src/shell/workspace.rs b/src/shell/workspace.rs
-index 5da3e1e..e2bcaa2 100644
---- a/src/shell/workspace.rs
-+++ b/src/shell/workspace.rs
-@@ -1692,6 +1692,7 @@ impl Workspace {
-                     }
-                     (None, None) => (fullscreen_geo, 1.0),
-                 };
-+                let alpha = alpha * crate::shell::layer_animation::windows_alpha(&self.output);
- 
-                 let render_loc = target_geo
-                     .loc
-@@ -1775,7 +1776,7 @@ impl Workspace {
-                 }
-                 OverviewMode::Active(_) => 0.6,
-                 OverviewMode::None => 1.0,
--            };
-+            } * crate::shell::layer_animation::windows_alpha(&self.output);
- 
-             // closed windows, over the others
-             for closing in self.closing_windows.iter().rev() {
-@@ -1969,7 +1970,7 @@ impl Workspace {
-                 }
-                 OverviewMode::Active(_) => 0.6,
-                 OverviewMode::None => 1.0,
--            };
-+            } * crate::shell::layer_animation::windows_alpha(&self.output);
- 
-             self.floating_layer
-                 .render_popups(renderer, alpha, scanout_node, &mut |elem| push(elem.into()));
-diff --git a/src/wayland/handlers/layer_shell.rs b/src/wayland/handlers/layer_shell.rs
-index 9653557..8ebc6f9 100644
---- a/src/wayland/handlers/layer_shell.rs
-+++ b/src/wayland/handlers/layer_shell.rs
-@@ -39,6 +39,7 @@ impl WlrLayerShellHandler for State {
+     fn alpha(&self) -> f32 {
+-        1.0
++        self.alpha
      }
  
-     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
-+        crate::shell::layer_animation::popup_created(popup.wl_surface());
-         self.common
-             .shell
-             .read()
-@@ -55,6 +56,15 @@ impl WlrLayerShellHandler for State {
-     }
- 
-     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-+        let closing = self.common.shell.read().outputs().find_map(|o| {
-+            let map = layer_map_for_output(o);
-+            map.layer_for_surface(surface.wl_surface(), WindowSurfaceType::TOPLEVEL)
-+                .map(|layer| (o.clone(), layer.clone()))
-+        });
-+        if let Some((output, layer)) = closing {
-+            crate::shell::layer_animation::picture_closing_layer(self, &output, &layer);
-+        }
-+
-         let mut shell = self.common.shell.write();
-         let maybe_output = shell
-             .outputs()
-diff --git a/src/wayland/handlers/xdg_shell/mod.rs b/src/wayland/handlers/xdg_shell/mod.rs
-index 0013e75..cc876fe 100644
---- a/src/wayland/handlers/xdg_shell/mod.rs
-+++ b/src/wayland/handlers/xdg_shell/mod.rs
-@@ -332,6 +332,10 @@ impl XdgShellHandler for State {
-         }
-     }
- 
-+    fn popup_destroyed(&mut self, surface: PopupSurface) {
-+        crate::shell::layer_animation::picture_closing_popup(self, surface.wl_surface());
-+    }
-+
-     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-         crate::shell::close_animation::picture_closing_window(self, surface.wl_surface());
- 
+     fn kind(&self) -> Kind {
+@@ -471,7 +479,7 @@ where
+                 &damage,
+                 opaque_regions,
+                 Transform::Normal,
+-                1.0,
++                self.alpha,
+             )?;
+             BorrowMut::<GlesFrame>::borrow_mut(<R as AsGlowRenderer>::glow_frame_mut(frame))
+                 .clear_tex_program_override();
+diff --git a/src/backend/render/wayland/mod.rs b/src/backend/render/wayland/mod.rs
+index c2b7d4e..18fa810 100644
+--- a/src/backend/render/wayland/mod.rs
++++ b/src/backend/render/wayland/mod.rs
+@@ -97,6 +97,7 @@ pub fn push_render_elements_from_surface_tree<R>(
+                                 scale.x,
+                                 radii,
+                                 blur_strength,
++                                alpha,
+                             );
+                             let elem: SurfaceRenderElement<R> = if radii.iter().any(|r| *r != 0)
+                                 && should_clip
 diff --git a/src/shell/layer_animation.rs b/src/shell/layer_animation.rs
 new file mode 100644
-index 0000000..d02309e
+index 0000000..63a4be9
 --- /dev/null
 +++ b/src/shell/layer_animation.rs
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,830 @@
 +//! The shell's layer surfaces open and close like GNOME's: the app library
 +//! and the launcher fade in growing into place, the workspaces overview fades
 +//! in settling from a little bigger while the windows fade out under it, and
@@ -323,7 +283,7 @@ index 0000000..d02309e
 +//! picture, read back from the GPU right before it goes, as for windows.
 +
 +use std::{
-+    sync::{Mutex, OnceLock},
++    sync::Mutex,
 +    time::{Duration, Instant},
 +};
 +
@@ -331,23 +291,29 @@ index 0000000..d02309e
 +use keyframe::{EasingFunction, functions::EaseOutQuad};
 +use smithay::{
 +    backend::{
-+        allocator::Fourcc,
++        allocator::{Fourcc, dmabuf::Dmabuf},
 +        renderer::{
-+            Offscreen,
++            ImportDma, Offscreen, Texture,
 +            damage::OutputDamageTracker,
 +            element::{
-+                Kind, RenderElement,
++                Id, Kind, RenderElement,
 +                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
++                texture::TextureRenderElement,
 +            },
 +            gles::GlesRenderbuffer,
-+            utils::with_renderer_surface_state,
++            utils::{CommitCounter, with_renderer_surface_state},
 +        },
 +    },
 +    desktop::{LayerSurface, PopupManager, layer_map_for_output},
 +    output::Output,
 +    reexports::wayland_server::protocol::wl_surface::WlSurface,
 +    utils::{Logical, Point, Rectangle, Scale, Size, Transform},
-+    wayland::compositor::with_states,
++    wayland::{
++        compositor::{
++            BufferAssignment, SurfaceAttributes, add_pre_commit_hook, get_children, with_states,
++        },
++        dmabuf::get_dmabuf,
++    },
 +};
 +use tracing::warn;
 +
@@ -355,11 +321,20 @@ index 0000000..d02309e
 +    backend::render::{
 +        RendererRef,
 +        element::AsGlowRenderer,
-+        wayland::{SurfaceRenderElement, push_render_elements_from_surface_tree},
++        wayland::{
++            SurfaceRenderElement,
++            blur_effect::{BlurElement, BlurState},
++            push_render_elements_from_surface_tree,
++        },
 +    },
++    shell::{CosmicMappedRenderElement, WorkspaceRenderElement},
 +    state::{State, advertised_node_for_surface},
-+    utils::quirks::{APP_LIBRARY_NAMESPACE, LAUNCHER_NAMESPACE, WORKSPACE_OVERVIEW_NAMESPACE},
++    utils::{
++        iced::IcedRenderElement,
++        quirks::{APP_LIBRARY_NAMESPACE, LAUNCHER_NAMESPACE, WORKSPACE_OVERVIEW_NAMESPACE},
++    },
 +    wayland::handlers::{
++        background_effect::ComputedBlurRegionCachedState,
 +        compositor::FRAME_TIME_FILTER,
 +        corner_radius::{pad_rect, surface_corners, surface_padding},
 +    },
@@ -418,17 +393,118 @@ index 0000000..d02309e
 +
 +struct Opening {
 +    animation: Animation,
-+    /// From its first frame with something to show.
-+    start: OnceLock<Instant>,
++    clock: Mutex<Clock>,
 +}
 +
++/// When a surface begins opening. The shell's clients (libcosmic) first show
++/// an empty frame, and what they have to show a frame or two later: it begins
++/// with the second frame, or a little after the first if none comes, and is
++/// hidden until then.
++#[derive(Default)]
++struct Clock {
++    /// The first frame, and when it was first drawn.
++    first: Option<(CommitCounter, Instant)>,
++    start: Option<Instant>,
++}
++
++/// How long to wait for the second frame.
++const SECOND_FRAME_WAIT: Duration = Duration::from_millis(50);
++
 +fn mark(surface: &WlSurface, animation: Animation) {
-+    with_states(surface, |states| {
++    let new = with_states(surface, |states| {
 +        states.data_map.insert_if_missing_threadsafe(|| Opening {
 +            animation,
-+            start: OnceLock::new(),
-+        });
++            clock: Mutex::default(),
++        })
 +    });
++    if new {
++        add_pre_commit_hook::<State, _>(surface, |_, _, surface| keep_shown(surface));
++    }
++}
++
++/// What a surface showed before its latest frame. COSMIC's shell clients take
++/// down their blur and rounded corners and draw one last frame as they close
++/// (the app library's, emptied), which the screen never really shows: such a
++/// surface closes as it was before it.
++pub struct Shown {
++    dmabuf: Dmabuf,
++    src: Rectangle<f64, Logical>,
++    dst: Size<i32, Logical>,
++    offset: Point<i32, Logical>,
++    buffer_scale: i32,
++    transform: Transform,
++    blur: Option<Vec<Rectangle<i32, Logical>>>,
++    padding: Option<[i32; 4]>,
++    radii: Option<[u8; 4]>,
++    /// Whether it had subsurfaces, which aren't kept.
++    has_children: bool,
++    /// When the frame after it came.
++    replaced: Instant,
++}
++
++#[derive(Default)]
++struct LastShown(Mutex<Option<Shown>>);
++
++/// A frame this recent before a surface closes is its last one.
++const LAST_FRAME: Duration = Duration::from_millis(50);
++
++/// Called as `surface` commits: keeps what it shows if a new frame replaces it.
++fn keep_shown(surface: &WlSurface) {
++    let new_frame = with_states(surface, |states| {
++        matches!(
++            states.cached_state.get::<SurfaceAttributes>().pending().buffer,
++            Some(BufferAssignment::NewBuffer(_))
++        )
++    });
++    if !new_frame {
++        return;
++    }
++    let current = with_renderer_surface_state(surface, |state| {
++        let dmabuf = get_dmabuf(state.buffer()?).ok()?.clone();
++        Some((dmabuf, state.view()?, state.buffer_scale(), state.buffer_transform()))
++    })
++    .flatten();
++    let has_children = !get_children(surface).is_empty();
++    with_states(surface, |states| {
++        let shown = current.map(|(dmabuf, view, buffer_scale, transform)| Shown {
++            dmabuf,
++            src: view.src,
++            dst: view.dst,
++            offset: view.offset,
++            buffer_scale,
++            transform,
++            blur: states
++                .cached_state
++                .get::<ComputedBlurRegionCachedState>()
++                .current()
++                .blur_region
++                .clone(),
++            padding: surface_padding(states),
++            radii: surface_corners(states, view.dst),
++            has_children,
++            replaced: Instant::now(),
++        });
++        *states
++            .data_map
++            .get_or_insert_threadsafe(LastShown::default)
++            .0
++            .lock()
++            .unwrap() = shown;
++    });
++}
++
++/// What `surface` showed before a frame it drew right as it closed, if it did.
++fn shown_before_closing(surface: &WlSurface) -> Option<Shown> {
++    with_states(surface, |states| {
++        states
++            .data_map
++            .get::<LastShown>()?
++            .0
++            .lock()
++            .unwrap()
++            .take()
++            .filter(|shown| shown.replaced.elapsed() < LAST_FRAME)
++    })
 +}
 +
 +/// Called as a layer surface maps.
@@ -443,20 +519,33 @@ index 0000000..d02309e
 +    mark(surface, POPUP);
 +}
 +
-+/// How far opening `surface` is, eased, if it is. Its clock starts once it
-+/// has something to show.
++/// How far opening `surface` is, eased, if it is.
 +fn opening_progress(surface: &WlSurface) -> Option<(Animation, f64)> {
-+    let has_buffer =
-+        with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
++    let frame = with_renderer_surface_state(surface, |state| {
++        state.buffer().is_some().then(|| state.current_commit())
++    })
++    .flatten();
 +    with_states(surface, |states| {
 +        let opening = states.data_map.get::<Opening>()?;
-+        let start = if has_buffer {
-+            *opening.start.get_or_init(Instant::now)
-+        } else {
-+            *opening.start.get()?
++        let now = Instant::now();
++        let mut clock = opening.clock.lock().unwrap();
++        let start = match (clock.start, clock.first, frame) {
++            (Some(start), _, _) => start,
++            (None, None, None) => return None,
++            (None, None, Some(frame)) => {
++                clock.first = Some((frame, now));
++                return Some((opening.animation, 0.0));
++            }
++            (None, Some((first, at)), frame)
++                if frame.is_some_and(|frame| frame != first)
++                    || now.duration_since(at) >= SECOND_FRAME_WAIT =>
++            {
++                *clock.start.insert(now)
++            }
++            (None, Some(_), _) => return Some((opening.animation, 0.0)),
 +        };
-+        let linear = Instant::now().duration_since(start).as_secs_f64()
-+            / opening.animation.open.as_secs_f64();
++        let linear =
++            now.duration_since(start).as_secs_f64() / opening.animation.open.as_secs_f64();
 +        (linear < 1.0).then(|| (opening.animation, EaseOutQuad.y(linear)))
 +    })
 +}
@@ -560,6 +649,91 @@ index 0000000..d02309e
 +    animation: Animation,
 +    origin: Point<f64, Logical>,
 +    start: Instant,
++    blur: Option<ClosingBlur>,
++}
++
++/// The blur behind a surface, kept as it closes: the picture can't have it,
++/// it's of what's behind.
++#[derive(Debug)]
++pub struct ClosingBlur {
++    state: Mutex<BlurState>,
++    /// Where it was on the output.
++    geometry: Rectangle<f64, Logical>,
++    /// What of that is blurred.
++    region: Vec<Rectangle<i32, Logical>>,
++    radii: [u8; 4],
++}
++
++impl ClosingBlur {
++    /// The blur behind what `shown` showed, if any, blurring `geometry` on the output.
++    fn from_shown(shown: &Shown, geometry: Rectangle<i32, Logical>) -> Option<Self> {
++        Some(ClosingBlur {
++            state: Mutex::new(BlurState::default()),
++            geometry: geometry.to_f64(),
++            region: shown.blur.clone()?,
++            radii: shown.radii.unwrap_or([0; 4]),
++        })
++    }
++
++    /// The blur behind `surface`, if it has any, blurring `geometry` on the output.
++    pub fn of(surface: &WlSurface, geometry: Rectangle<i32, Logical>) -> Option<Self> {
++        with_states(surface, |states| {
++            let region = states
++                .cached_state
++                .get::<ComputedBlurRegionCachedState>()
++                .current()
++                .blur_region
++                .clone()?;
++            Some(ClosingBlur {
++                state: Mutex::new(BlurState::default()),
++                geometry: geometry.to_f64(),
++                region,
++                radii: surface_corners(states, geometry.size).unwrap_or([0; 4]),
++            })
++        })
++    }
++
++    /// The blur, at `scale` around `origin` and fading to `alpha`.
++    pub fn element<R>(
++        &self,
++        renderer: &mut R,
++        origin: Point<f64, Logical>,
++        scale: f64,
++        alpha: f32,
++        output_scale: f64,
++        strength: usize,
++    ) -> Option<BlurElement>
++    where
++        R: AsGlowRenderer + smithay::backend::renderer::ImportAll,
++    {
++        let geometry = Rectangle::new(
++            origin + (self.geometry.loc - origin).upscale(scale),
++            self.geometry.size.upscale(scale),
++        );
++        let region = self
++            .region
++            .iter()
++            .map(|rect| {
++                Rectangle::new(
++                    rect.loc.to_f64().upscale(scale).to_i32_round(),
++                    rect.size.to_f64().upscale(scale).to_i32_round(),
++                )
++            })
++            .collect();
++        let radii = self.radii.map(|r| (r as f64 * scale).round() as u8);
++        BlurElement::internal(
++            renderer,
++            &mut self.state.lock().unwrap(),
++            geometry,
++            &region,
++            output_scale,
++            radii,
++            strength,
++            alpha,
++        )
++        .ok()
++        .flatten()
++    }
 +}
 +
 +impl ClosingLayer {
@@ -597,23 +771,42 @@ index 0000000..d02309e
 +    }
 +}
 +
-+/// The closing surfaces on `output`, topmost first.
++/// The closing surfaces on `output`, topmost first, each over its blur.
 +pub fn closing_elements<R>(
 +    renderer: &mut R,
 +    output: &Output,
-+) -> Vec<MemoryRenderBufferRenderElement<R>>
++    blur_strength: usize,
++) -> Vec<WorkspaceRenderElement<R>>
 +where
-+    R: AsGlowRenderer,
++    R: AsGlowRenderer + smithay::backend::renderer::ImportAll,
 +    R::TextureId: Send + Clone + 'static,
 +{
 +    let scale = output.current_scale().fractional_scale();
-+    closing_layers(output)
-+        .lock()
-+        .unwrap()
-+        .iter()
-+        .rev()
-+        .filter_map(|closing| closing.render_element(renderer, scale))
-+        .collect()
++    let mut elements = Vec::new();
++    for closing in closing_layers(output).lock().unwrap().iter().rev() {
++        if let Some(elem) = closing.render_element(renderer, scale) {
++            elements.push(WorkspaceRenderElement::Window(
++                CosmicMappedRenderElement::from(IcedRenderElement::UI(elem)),
++            ));
++        }
++        if let Some(blur) = &closing.blur {
++            let progress = EaseOutQuad.y(closing.progress());
++            let by = 1.0 + (closing.animation.scale - 1.0) * progress;
++            if let Some(elem) = blur.element(
++                renderer,
++                closing.origin,
++                by,
++                (1.0 - progress) as f32,
++                scale,
++                blur_strength,
++            ) {
++                elements.push(WorkspaceRenderElement::OverrideRedirect(
++                    SurfaceRenderElement::Blur(elem),
++                ));
++            }
++        }
++    }
++    elements
 +}
 +
 +/// A picture of the surface tree of `surface`, whose origin is at `loc` and
@@ -654,15 +847,64 @@ index 0000000..d02309e
 +        None,
 +    );
 +    anyhow::ensure!(!elements.is_empty(), "nothing to picture");
++    render_picture(renderer, size, scale, &elements)
++}
 +
++/// A picture of what `shown` showed, at `loc` in `area` (on the output) at `scale`.
++fn picture_shown<R>(
++    renderer: &mut R,
++    shown: &Shown,
++    loc: Point<i32, Logical>,
++    area: Rectangle<i32, Logical>,
++    scale: f64,
++) -> anyhow::Result<(MemoryRenderBuffer, Size<i32, Logical>)>
++where
++    R: AsGlowRenderer + ImportDma,
++    R::TextureId: Texture + Send + Clone + 'static,
++    R::Error: Send + Sync + 'static,
++    TextureRenderElement<R::TextureId>: RenderElement<R>,
++{
++    let size = area.size.to_physical_precise_round(scale);
++    anyhow::ensure!(size.w > 0 && size.h > 0, "nothing to picture");
++    let texture = renderer.import_dmabuf(&shown.dmabuf, None)?;
++    let element = TextureRenderElement::from_static_texture(
++        Id::new(),
++        renderer.context_id(),
++        (loc + shown.offset - area.loc).to_f64().to_physical(scale),
++        texture,
++        shown.buffer_scale,
++        shown.transform,
++        None,
++        Some(shown.src),
++        Some(shown.dst),
++        None,
++        Kind::Unspecified,
++    );
++    render_picture(renderer, size, scale, &[element])
++}
++
++/// Draws `elements` into a picture of `size` pixels, laid out at `scale`.
++fn render_picture<R, E>(
++    renderer: &mut R,
++    size: Size<i32, smithay::utils::Physical>,
++    scale: f64,
++    elements: &[E],
++) -> anyhow::Result<(MemoryRenderBuffer, Size<i32, Logical>)>
++where
++    R: AsGlowRenderer,
++    R::Error: Send + Sync + 'static,
++    E: RenderElement<R>,
++{
 +    let format = Fourcc::Abgr8888;
 +    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
 +    let mut render_buffer =
 +        Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
 +    let mut fb = renderer.bind(&mut render_buffer)?;
-+    let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
++    // at the scale the elements were laid out at, or they come out that much
++    // smaller (or bigger), from the top left
++    let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
 +    damage_tracker
-+        .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
++        .render_output(renderer, &mut fb, 0, elements, [0.0, 0.0, 0.0, 0.0])
 +        .map_err(|err| match err {
 +            smithay::backend::renderer::damage::Error::Rendering(err) => err,
 +            smithay::backend::renderer::damage::Error::OutputNoMode(_) => unreachable!(),
@@ -676,12 +918,15 @@ index 0000000..d02309e
 +
 +struct Target {
 +    surface: WlSurface,
++    /// What it showed before its last frame, to picture instead.
++    shown: Option<Shown>,
 +    output: Output,
 +    loc: Point<i32, Logical>,
 +    geometry: Rectangle<i32, Logical>,
 +    area: Rectangle<i32, Logical>,
 +    animation: Animation,
 +    origin: Point<f64, Logical>,
++    blur: Option<ClosingBlur>,
 +}
 +
 +fn keep_picture(state: &mut State, target: Target) {
@@ -694,8 +939,14 @@ index 0000000..d02309e
 +                .or(*kms.primary_node.read().unwrap())
 +        })
 +        .context("No renderer to picture the closing surface")
-+        .and_then(|renderer| match renderer {
-+            RendererRef::Glow(renderer) => picture(
++        .and_then(|renderer| match (renderer, &target.shown) {
++            (RendererRef::Glow(renderer), Some(shown)) => {
++                picture_shown(renderer, shown, target.loc, target.area, scale)
++            }
++            (RendererRef::GlMulti(mut renderer), Some(shown)) => {
++                picture_shown(&mut renderer, shown, target.loc, target.area, scale)
++            }
++            (RendererRef::Glow(renderer), None) => picture(
 +                renderer,
 +                &target.surface,
 +                target.loc,
@@ -703,7 +954,7 @@ index 0000000..d02309e
 +                target.area,
 +                scale,
 +            ),
-+            RendererRef::GlMulti(mut renderer) => picture(
++            (RendererRef::GlMulti(mut renderer), None) => picture(
 +                &mut renderer,
 +                &target.surface,
 +                target.loc,
@@ -725,6 +976,7 @@ index 0000000..d02309e
 +                    animation: target.animation,
 +                    origin: target.origin,
 +                    start: Instant::now(),
++                    blur: target.blur,
 +                });
 +            state.backend.schedule_render(&target.output);
 +        }
@@ -750,10 +1002,14 @@ index 0000000..d02309e
 +    let loc = layer_geometry.loc;
 +    let mut geometry = layer.geometry();
 +    geometry.loc += loc;
-+    let shown = with_states(layer.wl_surface(), |states| {
-+        surface_padding(states).and_then(|padding| pad_rect(geometry, &padding))
-+    })
-+    .unwrap_or(geometry);
++    let before = shown_before_closing(layer.wl_surface());
++    let padding = match &before {
++        Some(before) => before.padding,
++        None => with_states(layer.wl_surface(), surface_padding),
++    };
++    let shown = padding
++        .and_then(|padding| pad_rect(geometry, &padding))
++        .unwrap_or(geometry);
 +    let area = if shown == geometry {
 +        geometry
 +    } else {
@@ -763,16 +1019,23 @@ index 0000000..d02309e
 +        area.intersection(geometry).unwrap_or(shown)
 +    };
 +
++    let blur = match &before {
++        Some(before) => ClosingBlur::from_shown(before, shown),
++        None => ClosingBlur::of(layer.wl_surface(), shown),
++    };
 +    keep_picture(
 +        state,
 +        Target {
 +            surface: layer.wl_surface().clone(),
++            // its subsurfaces go with the last frame
++            shown: before.filter(|before| !before.has_children),
 +            output: output.clone(),
 +            loc,
 +            geometry,
 +            area,
 +            animation,
 +            origin: origin(&animation, shown.to_f64()),
++            blur,
 +        },
 +    );
 +}
@@ -812,16 +1075,23 @@ index 0000000..d02309e
 +    if !below {
 +        animation.origin.1 = 1.0;
 +    }
++    let before = shown_before_closing(surface);
++    let blur = match &before {
++        Some(before) => ClosingBlur::from_shown(before, geometry),
++        None => ClosingBlur::of(surface, geometry),
++    };
 +    keep_picture(
 +        state,
 +        Target {
 +            surface: surface.clone(),
++            shown: before.filter(|before| !before.has_children),
 +            output,
 +            loc,
 +            geometry,
 +            area: geometry,
 +            animation,
 +            origin: origin(&animation, geometry.to_f64()),
++            blur,
 +        },
 +    );
 +}
@@ -835,3 +1105,148 @@ index 0000000..d02309e
 +    geometry.loc.y as f64 + geometry.size.h as f64 / 2.0
 +        >= layer_geometry.loc.y as f64 + layer_geometry.size.h as f64 / 2.0
 +}
+diff --git a/src/shell/layout/tiling/mod.rs b/src/shell/layout/tiling/mod.rs
+index 8706dc5..97cdc8f 100644
+--- a/src/shell/layout/tiling/mod.rs
++++ b/src/shell/layout/tiling/mod.rs
+@@ -5452,6 +5452,9 @@ fn render_new_tree_windows<R>(
+         );
+     }
+ 
++    // fading out under the workspaces overview
++    let windows_alpha = crate::shell::layer_animation::windows_alpha(output);
++
+     // render actual tree nodes
+     render_new_tree(
+         target_tree,
+@@ -5462,6 +5465,7 @@ fn render_new_tree_windows<R>(
+         swap_tree,
+         swap_desc.as_ref(),
+         |node_id, data, geo, original_geo, alpha, animating| {
++            let alpha = alpha * windows_alpha;
+             if swap_desc.as_ref().map(|desc| &desc.node) == Some(&node_id)
+                 || focused.as_ref() == Some(&node_id)
+             {
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 535e06d..5a43857 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -94,6 +94,7 @@ use crate::{
+ };
+ 
+ pub mod close_animation;
++pub mod layer_animation;
+ pub mod element;
+ pub mod focus;
+ pub mod grabs;
+@@ -2311,6 +2312,7 @@ impl Shell {
+             .workspaces
+             .spaces()
+             .any(|workspace| workspace.animations_going())
++            || self.outputs().any(layer_animation::animating)
+             || self.zoom_state.as_ref().is_some_and(|_| {
+                 self.outputs().any(|o| {
+                     o.user_data()
+@@ -2333,6 +2335,9 @@ impl Shell {
+         for workspace in self.workspaces.spaces_mut() {
+             clients.extend(workspace.update_animations());
+         }
++        for output in self.outputs() {
++            layer_animation::update(output);
++        }
+         clients
+     }
+ 
+@@ -3065,6 +3070,7 @@ impl Shell {
+             let mut map = layer_map_for_output(&pending.output);
+             map.map_layer(&pending.surface).unwrap();
+         }
++        layer_animation::layer_mapped(&pending.surface);
+         for workspace in self.workspaces.spaces_mut() {
+             workspace.tiling_layer.recalculate();
+         }
+diff --git a/src/shell/workspace.rs b/src/shell/workspace.rs
+index 5da3e1e..e2bcaa2 100644
+--- a/src/shell/workspace.rs
++++ b/src/shell/workspace.rs
+@@ -1692,6 +1692,7 @@ impl Workspace {
+                     }
+                     (None, None) => (fullscreen_geo, 1.0),
+                 };
++                let alpha = alpha * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+                 let render_loc = target_geo
+                     .loc
+@@ -1775,7 +1776,7 @@ impl Workspace {
+                 }
+                 OverviewMode::Active(_) => 0.6,
+                 OverviewMode::None => 1.0,
+-            };
++            } * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+             // closed windows, over the others
+             for closing in self.closing_windows.iter().rev() {
+@@ -1969,7 +1970,7 @@ impl Workspace {
+                 }
+                 OverviewMode::Active(_) => 0.6,
+                 OverviewMode::None => 1.0,
+-            };
++            } * crate::shell::layer_animation::windows_alpha(&self.output);
+ 
+             self.floating_layer
+                 .render_popups(renderer, alpha, scanout_node, &mut |elem| push(elem.into()));
+diff --git a/src/utils/iced/mod.rs b/src/utils/iced/mod.rs
+index 4522644..46d0895 100644
+--- a/src/utils/iced/mod.rs
++++ b/src/utils/iced/mod.rs
+@@ -1239,6 +1239,7 @@ impl<P: Program + Send + 'static> IcedElement<P> {
+                     scale.x,
+                     radii,
+                     (internal_ref.theme.cosmic().frosted as u8 + 1) as usize,
++                    alpha,
+                 ) {
+                     Ok(Some(elem)) => {
+                         if let Some(push_below) = push_below {
+diff --git a/src/wayland/handlers/layer_shell.rs b/src/wayland/handlers/layer_shell.rs
+index 9653557..8ebc6f9 100644
+--- a/src/wayland/handlers/layer_shell.rs
++++ b/src/wayland/handlers/layer_shell.rs
+@@ -39,6 +39,7 @@ impl WlrLayerShellHandler for State {
+     }
+ 
+     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
++        crate::shell::layer_animation::popup_created(popup.wl_surface());
+         self.common
+             .shell
+             .read()
+@@ -55,6 +56,15 @@ impl WlrLayerShellHandler for State {
+     }
+ 
+     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
++        let closing = self.common.shell.read().outputs().find_map(|o| {
++            let map = layer_map_for_output(o);
++            map.layer_for_surface(surface.wl_surface(), WindowSurfaceType::TOPLEVEL)
++                .map(|layer| (o.clone(), layer.clone()))
++        });
++        if let Some((output, layer)) = closing {
++            crate::shell::layer_animation::picture_closing_layer(self, &output, &layer);
++        }
++
+         let mut shell = self.common.shell.write();
+         let maybe_output = shell
+             .outputs()
+diff --git a/src/wayland/handlers/xdg_shell/mod.rs b/src/wayland/handlers/xdg_shell/mod.rs
+index 0013e75..cc876fe 100644
+--- a/src/wayland/handlers/xdg_shell/mod.rs
++++ b/src/wayland/handlers/xdg_shell/mod.rs
+@@ -332,6 +332,10 @@ impl XdgShellHandler for State {
+         }
+     }
+ 
++    fn popup_destroyed(&mut self, surface: PopupSurface) {
++        crate::shell::layer_animation::picture_closing_popup(self, surface.wl_surface());
++    }
++
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+         crate::shell::close_animation::picture_closing_window(self, surface.wl_surface());
+ 

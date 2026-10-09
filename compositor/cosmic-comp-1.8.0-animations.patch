@@ -1,9 +1,9 @@
 diff --git a/src/shell/close_animation.rs b/src/shell/close_animation.rs
 new file mode 100644
-index 0000000..b578893
+index 0000000..c3bcbef
 --- /dev/null
 +++ b/src/shell/close_animation.rs
-@@ -0,0 +1,209 @@
+@@ -0,0 +1,211 @@
 +//! Closing windows shrink a little and fade out, like GNOME's. The client
 +//! takes the window's contents with it, so what it last showed is kept as a
 +//! picture, read back from the GPU right before the window goes.
@@ -98,7 +98,9 @@ index 0000000..b578893
 +        let mut render_buffer =
 +            Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
 +        let mut fb = renderer.bind(&mut render_buffer)?;
-+        let mut damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
++        // at the scale the elements were laid out at, or they come out that
++        // much smaller (or bigger), from the top left
++        let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
 +        damage_tracker
 +            .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
 +            .map_err(|err| match err {
