@@ -1,6 +1,7 @@
 #!/bin/sh
 # Put the system's cosmic-comp back, as install.sh kept it. Then log out and
-# back in. (Reinstalling the package does the same: sudo dnf reinstall cosmic-comp.)
+# back in. Reinstalling the package does the same: sudo dnf reinstall cosmic-comp,
+# sudo apt install --reinstall cosmic-comp or sudo pacman -S cosmic-comp.
 set -e
 bin=$(command -v cosmic-comp)
 if [ ! -f "$bin.orig" ]; then

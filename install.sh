@@ -4,6 +4,7 @@
 set -e
 prefix="${1:-$HOME/.local}"
 id=io.github.DrakRosmann.CosmicGestures
+"$(dirname "$0")/deps.sh"
 cargo build --release
 install -Dm0755 target/release/cosmic-ext-gestures "$prefix/bin/cosmic-ext-gestures"
 mkdir -p "$prefix/share/applications"

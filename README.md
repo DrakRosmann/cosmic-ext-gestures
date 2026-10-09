@@ -57,19 +57,38 @@ o iniciador, a visão geral e os popups, que os apps destroem ao fechar.
 
 ## Instalar
 
-O compositor (precisa de `sudo` para trocar o `/usr/bin/cosmic-comp`, e de Rust e das
-bibliotecas de desenvolvimento do `cosmic-comp`):
+Funciona no Fedora, no Debian e derivados (Ubuntu, Pop!_OS, Mint…) e no Arch e
+derivados (Manjaro, EndeavourOS…), com o COSMIC 1.8.0 instalado pelo sistema. Os
+scripts pedem `sudo` para instalar o que faltar e para trocar o `/usr/bin/cosmic-comp`.
+
+O compositor:
 
 ```sh
 compositor/install.sh
 ```
 
-Ele baixa o `cosmic-comp` da mesma versão do sistema, aplica os patches, compila, guarda o
-original como `cosmic-comp.orig` e põe o novo no lugar. Saia da sessão e entre de novo.
+Ele descobre a versão do `cosmic-comp` instalada (pelo `rpm`, `dpkg` ou `pacman`), baixa o
+código dela, aplica os patches, instala o que faltar para compilar (`deps.sh`, com `dnf`,
+`apt` ou `pacman`), compila, guarda o original como `cosmic-comp.orig` e põe o novo no
+lugar. Saia da sessão e entre de novo.
+
+O `cosmic-comp` pede um Rust recente (1.93 para o 1.8.0), mais novo que o de várias
+distribuições (Debian, Ubuntu e Pop!_OS LTS). Se o do sistema for antigo, o script avisa:
+instale o Rust pelo [rustup](https://rustup.rs) e rode de novo.
+
+Os patches são para o `cosmic-comp` 1.8.0. Com outra versão, o script avisa e para: o
+patch precisa ser atualizado para ela.
 
 Se a sessão não abrir: Ctrl+Alt+F3, entre, e rode `sudo mv /usr/bin/cosmic-comp.orig
-/usr/bin/cosmic-comp` (ou `sudo dnf reinstall cosmic-comp`). `compositor/restore.sh`
-faz o mesmo de dentro da sessão.
+/usr/bin/cosmic-comp`, ou reinstale o pacote:
+
+| | |
+| --- | --- |
+| Fedora | `sudo dnf reinstall cosmic-comp` |
+| Debian, Ubuntu, Pop!_OS | `sudo apt install --reinstall cosmic-comp` |
+| Arch | `sudo pacman -S cosmic-comp` |
+
+`compositor/restore.sh` faz o mesmo de dentro da sessão.
 
 Uma atualização do `cosmic-comp` pelo sistema troca o compositor de volta pelo original:
 rode `compositor/install.sh` de novo (para uma versão nova, o patch precisa ser
@@ -101,6 +120,12 @@ and fading, and minimizing, maximizing and switching workspaces use GNOME's timi
 curves. A third one animates the shell's layers like GNOME's: the app library,
 the launcher, the workspaces overview (the windows fading out under it) and the
 panel's popups fade in growing into place, and close the other way.
+
+It works on Fedora, Debian and its derivatives (Ubuntu, Pop!_OS, Mint…) and Arch and its
+derivatives: `compositor/install.sh` finds the installed `cosmic-comp` version with `rpm`,
+`dpkg` or `pacman`, and `deps.sh` installs what building it needs with `dnf`, `apt` or
+`pacman`. `cosmic-comp` 1.8.0 needs Rust 1.93 or newer; where the distribution's is older,
+install it with [rustup](https://rustup.rs). Then `./install.sh` installs the app.
 
 ## Licença
 
