@@ -1,6 +1,7 @@
 #!/bin/sh
-# Build cosmic-comp, the version the system has, with the gestures patch, and
-# put it in place of the system's, keeping that one as cosmic-comp.orig.
+# Build cosmic-comp, the version the system has, with the gestures and the
+# animations patches, and put it in place of the system's, keeping that one as
+# cosmic-comp.orig.
 #   compositor/install.sh          # the version from rpm
 #   compositor/install.sh 1.8.0    # or say which
 # Then log out and back in. compositor/restore.sh puts the original back.
@@ -11,20 +12,25 @@ if [ -z "$version" ]; then
     echo "Which cosmic-comp version? Like: $0 1.8.0" >&2
     exit 1
 fi
-patch="$here/cosmic-comp-$version-gestures.patch"
-if [ ! -f "$patch" ]; then
-    echo "There is no patch for cosmic-comp $version yet." >&2
-    exit 1
-fi
+patches="$here/cosmic-comp-$version-gestures.patch $here/cosmic-comp-$version-animations.patch"
+for patch in $patches; do
+    if [ ! -f "$patch" ]; then
+        echo "There is no patch for cosmic-comp $version yet." >&2
+        exit 1
+    fi
+done
 
 src="${XDG_CACHE_HOME:-$HOME/.cache}/cosmic-ext-gestures/cosmic-comp-$version"
 if [ ! -d "$src" ]; then
     git clone --depth 1 --branch "epoch-$version" https://github.com/pop-os/cosmic-comp "$src"
 fi
-# A clean tree takes the patch; one already patched keeps it.
-if git -C "$src" diff --quiet; then
+# Patched from a clean tree each time, so updated patches take. The build in
+# target/ is kept.
+git -C "$src" reset --quiet --hard
+git -C "$src" clean --quiet -fd
+for patch in $patches; do
     git -C "$src" apply "$patch"
-fi
+done
 (cd "$src" && cargo build --release)
 
 bin=$(command -v cosmic-comp)
