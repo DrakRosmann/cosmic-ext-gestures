@@ -44,7 +44,8 @@ Como no GNOME (os tempos e as curvas são os do `gnome-shell`):
 | Abrir janela | aparece de uma vez | cresce do meio da borda de baixo e aparece aos poucos (150 ms) |
 | Fechar janela | some de uma vez | encolhe um pouco e some aos poucos (150 ms) |
 | Minimizar e restaurar | 320 ms, curva simétrica | 400 ms, rápido no começo e devagar no fim |
-| Maximizar e encaixar | 200 ms, curva simétrica | 250 ms, desacelerando |
+| Maximizar e restaurar | a janela começa a ir com o conteúdo antigo e salta para o novo no meio do caminho; o desfoque some ou volta de uma vez | espera o app se redesenhar e então cresce (ou encolhe) com o conteúdo antigo por cima, sumindo aos poucos junto com o desfoque (250 ms, desacelerando) |
+| Encaixar | 200 ms, curva simétrica | 250 ms, desacelerando |
 | Trocar de espaço pelo teclado | 200 ms, curva simétrica | 250 ms, desacelerando |
 | Biblioteca de apps | aparece e some de uma vez | cresce do centro e aparece aos poucos (250 ms); ao fechar, encolhe e some (200 ms) |
 | Iniciador | aparece e some de uma vez | cresce de cima e aparece aos poucos (200 ms); ao fechar, o contrário (150 ms) |
@@ -63,6 +64,16 @@ um quadro vazio e o conteúdo um ou dois quadros depois: a animação começa no
 quadro, senão ela podia passar inteira sobre o quadro vazio. E ao fechar eles desligam o
 desfoque e os cantos e desenham um último quadro (o da biblioteca de apps, sem os
 ícones) que a tela nunca chega a mostrar: o que fecha é o que estava na tela antes dele.
+
+Ao maximizar, os apps do COSMIC deixam de ser translúcidos e ficam opacos, e ao
+restaurar voltam a ser translúcidos com desfoque. No COSMIC 1.8 a animação começa antes
+do app se redesenhar no tamanho novo: a janela anda com o conteúdo antigo esticado e,
+quando o app responde, o conteúdo e o desfoque trocam de uma vez no meio do caminho.
+Com o patch o compositor tira uma foto da janela antes de avisar o app, mostra a foto
+parada até o app se redesenhar (no máximo 300 ms) e então anima a janela nova do
+tamanho antigo ao novo, com a foto esticada junto por cima, sumindo aos poucos com o
+desfoque que tinha atrás, como no GNOME. Vale para janelas flutuantes; uma janela que
+volta para o modo lado a lado ao restaurar anima como antes.
 
 ### Visão geral sem engasgos
 
@@ -150,7 +161,11 @@ then app library, app library, launcher, go back, run a command), scripts to bui
 install and restore it, and an app to set the gestures. Another patch makes window
 animations GNOME's: windows open growing from their bottom middle and close shrinking
 and fading, and minimizing, maximizing and switching workspaces use GNOME's timing and
-curves. A third one animates the shell's layers like GNOME's: the app library,
+curves; maximizing and restoring wait for the app to draw itself at the new size, then
+grow (or shrink) the window under a picture of how it was, fading out with the blur that
+was behind it (COSMIC's apps turn opaque when maximized and see-through when not), instead
+of stretching the old contents and switching them and the blur at once halfway. A third
+one animates the shell's layers like GNOME's: the app library,
 the launcher, the workspaces overview (the windows fading out under it) and the
 panel's popups fade in growing into place, and close the other way, their background blur along with them; they begin with
 their second frame, as COSMIC's apps show an empty one first, and close as they were

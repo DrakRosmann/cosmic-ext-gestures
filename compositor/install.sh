@@ -30,7 +30,7 @@ installed_version() {
 # The patches for $1 at version $2, in order, or nothing if one is missing.
 patches_for() {
     case $1 in
-        cosmic-comp) names="gestures animations layer-animations overview" ;;
+        cosmic-comp) names="gestures animations layer-animations overview resize" ;;
         cosmic-workspaces) names="overview" ;;
     esac
     list=

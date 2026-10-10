@@ -1,0 +1,684 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index aa31a46..aba35e1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -218,6 +218,9 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
+             }
+         }
+ 
++        // pictures of windows about to change size, before their clients hear of it
++        shell::resize_animation::picture_resizing_windows(state);
++
+         // send out events
+         let _ = state.common.display_handle.flush_clients();
+ 
+diff --git a/src/shell/close_animation.rs b/src/shell/close_animation.rs
+index c3bcbef..2923d20 100644
+--- a/src/shell/close_animation.rs
++++ b/src/shell/close_animation.rs
+@@ -63,54 +63,16 @@ impl ClosingWindow {
+         R::Error: Send + Sync + 'static,
+         CosmicMappedRenderElement<R>: RenderElement<R>,
+     {
+-        let bbox = SpaceElement::bbox(mapped);
++        let (buffer, bbox, pixels) = picture_mapped(renderer, mapped, scale)?;
+         let area = Rectangle::new(
+             geometry.loc.as_logical() - mapped.geometry().loc + bbox.loc,
+             bbox.size,
+         );
+-        let size = bbox.size.to_physical_precise_round(scale);
+-        anyhow::ensure!(size.w > 0 && size.h > 0, "nothing to picture");
+-
+-        let origin: Point<i32, Physical> = bbox.loc.to_physical_precise_round(scale);
+-        let mut elements = Vec::new();
+-        let mut below = Vec::new();
+-        mapped.push_render_elements(
+-            renderer,
+-            Point::from((-origin.x, -origin.y)),
+-            None,
+-            Scale::from(scale),
+-            1.0,
+-            None,
+-            None,
+-            &mut |elem| elements.push(elem),
+-            &mut |elem| below.push(elem),
+-        );
+-        elements.extend(below);
+-
+-        let format = Fourcc::Abgr8888;
+-        let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+-        let mut render_buffer =
+-            Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
+-        let mut fb = renderer.bind(&mut render_buffer)?;
+-        // at the scale the elements were laid out at, or they come out that
+-        // much smaller (or bigger), from the top left
+-        let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
+-        damage_tracker
+-            .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+-            .map_err(|err| match err {
+-                smithay::backend::renderer::damage::Error::Rendering(err) => err,
+-                smithay::backend::renderer::damage::Error::OutputNoMode(_) => unreachable!(),
+-            })?;
+-        let mapping =
+-            renderer.copy_framebuffer(&fb, Rectangle::from_size(buffer_size), format)?;
+-        let pixels = renderer.map_texture(&mapping)?;
+-        let buffer =
+-            MemoryRenderBuffer::from_slice(pixels, format, buffer_size, 1, Transform::Normal, None);
+ 
+         Ok(ClosingWindow {
+             buffer,
+             area,
+-            pixels: size.to_logical(1),
++            pixels,
+             start: Instant::now(),
+         })
+     }
+@@ -159,6 +121,61 @@ impl ClosingWindow {
+     }
+ }
+ 
++/// A picture of `mapped` as it is now, at `scale`: the pixels, what they
++/// cover (its bounding box, where its own geometry starts at
++/// `mapped.geometry().loc`) and how many there are.
++pub(crate) fn picture_mapped<R>(
++    renderer: &mut R,
++    mapped: &CosmicMapped,
++    scale: f64,
++) -> anyhow::Result<(MemoryRenderBuffer, Rectangle<i32, Logical>, Size<i32, Logical>)>
++where
++    R: AsGlowRenderer,
++    R::TextureId: Send + Clone + 'static,
++    R::Error: Send + Sync + 'static,
++    CosmicMappedRenderElement<R>: RenderElement<R>,
++{
++    let bbox = SpaceElement::bbox(mapped);
++    let size = bbox.size.to_physical_precise_round(scale);
++    anyhow::ensure!(size.w > 0 && size.h > 0, "nothing to picture");
++
++    let origin: Point<i32, Physical> = bbox.loc.to_physical_precise_round(scale);
++    let mut elements = Vec::new();
++    let mut below = Vec::new();
++    mapped.push_render_elements(
++        renderer,
++        Point::from((-origin.x, -origin.y)),
++        None,
++        Scale::from(scale),
++        1.0,
++        None,
++        None,
++        &mut |elem| elements.push(elem),
++        &mut |elem| below.push(elem),
++    );
++    elements.extend(below);
++
++    let format = Fourcc::Abgr8888;
++    let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
++    let mut render_buffer =
++        Offscreen::<GlesRenderbuffer>::create_buffer(renderer, format, buffer_size)?;
++    let mut fb = renderer.bind(&mut render_buffer)?;
++    // at the scale the elements were laid out at, or they come out that
++    // much smaller (or bigger), from the top left
++    let mut damage_tracker = OutputDamageTracker::new(size, scale, Transform::Normal);
++    damage_tracker
++        .render_output(renderer, &mut fb, 0, &elements, [0.0, 0.0, 0.0, 0.0])
++        .map_err(|err| match err {
++            smithay::backend::renderer::damage::Error::Rendering(err) => err,
++            smithay::backend::renderer::damage::Error::OutputNoMode(_) => unreachable!(),
++        })?;
++    let mapping = renderer.copy_framebuffer(&fb, Rectangle::from_size(buffer_size), format)?;
++    let pixels = renderer.map_texture(&mapping)?;
++    let buffer =
++        MemoryRenderBuffer::from_slice(pixels, format, buffer_size, 1, Transform::Normal, None);
++    Ok((buffer, bbox, size.to_logical(1)))
++}
++
+ /// Keeps a picture of the window `surface` is, to fade out once it's gone.
+ /// For a shown window alone in its element (in a stack, another one takes
+ /// its place); called right before unmapping it.
+diff --git a/src/shell/layer_animation.rs b/src/shell/layer_animation.rs
+index 63a4be9..176e030 100644
+--- a/src/shell/layer_animation.rs
++++ b/src/shell/layer_animation.rs
+@@ -416,6 +416,47 @@ impl ClosingBlur {
+         })
+     }
+ 
++    /// The blur stretched over `to`, fading to `alpha`.
++    pub fn element_in<R>(
++        &self,
++        renderer: &mut R,
++        to: Rectangle<f64, Logical>,
++        alpha: f32,
++        output_scale: f64,
++        strength: usize,
++    ) -> Option<BlurElement>
++    where
++        R: AsGlowRenderer + smithay::backend::renderer::ImportAll,
++    {
++        let x = to.size.w / self.geometry.size.w.max(1.0);
++        let y = to.size.h / self.geometry.size.h.max(1.0);
++        let region = self
++            .region
++            .iter()
++            .map(|rect| {
++                Rectangle::new(
++                    Point::<f64, Logical>::from((rect.loc.x as f64 * x, rect.loc.y as f64 * y))
++                        .to_i32_round(),
++                    Size::<f64, Logical>::from((rect.size.w as f64 * x, rect.size.h as f64 * y))
++                        .to_i32_round(),
++                )
++            })
++            .collect();
++        let radii = self.radii.map(|r| (r as f64 * x.min(y)).round().min(255.0) as u8);
++        BlurElement::internal(
++            renderer,
++            &mut self.state.lock().unwrap(),
++            to,
++            &region,
++            output_scale,
++            radii,
++            strength,
++            alpha,
++        )
++        .ok()
++        .flatten()
++    }
++
+     /// The blur, at `scale` around `origin` and fading to `alpha`.
+     pub fn element<R>(
+         &self,
+diff --git a/src/shell/layout/floating/mod.rs b/src/shell/layout/floating/mod.rs
+index 457eb56..42d37c3 100644
+--- a/src/shell/layout/floating/mod.rs
++++ b/src/shell/layout/floating/mod.rs
+@@ -21,7 +21,7 @@ use smithay::{
+     desktop::{PopupKind, Space, WindowSurfaceType, layer_map_for_output, space::SpaceElement},
+     input::Seat,
+     output::Output,
+-    utils::{IsAlive, Logical, Point, Rectangle, Scale, Size},
++    utils::{IsAlive, Logical, Point, Rectangle, Scale, Serial, Size},
+     wayland::seat::WaylandFocus,
+ };
+ 
+@@ -40,6 +40,7 @@ use crate::{
+             target::{KeyboardFocusTarget, PointerFocusTarget},
+         },
+         grabs::{GrabStartData, ReleaseMode, ResizeEdge},
++        resize_animation::ResizePicture,
+     },
+     state::State,
+     utils::{prelude::*, tween::{EaseOutExpo, EaseRectangle}},
+@@ -53,6 +54,9 @@ pub use self::grabs::*;
+ pub const ANIMATION_DURATION: Duration = Duration::from_millis(250);
+ pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(400);
+ pub const OPEN_ANIMATION_DURATION: Duration = Duration::from_millis(150);
++/// How long a window changing size is waited for to draw itself at the new
++/// size before it's animated anyway.
++const RESIZE_WAIT: Duration = Duration::from_millis(300);
+ 
+ #[derive(Debug, Default)]
+ pub struct FloatingLayout {
+@@ -71,6 +75,8 @@ enum Animation {
+     Tiled {
+         start: Instant,
+         previous_geometry: Rectangle<i32, Local>,
++        /// When the window changes size, too.
++        resize: Option<Box<Resize>>,
+     },
+     Minimize {
+         start: Instant,
+@@ -89,7 +95,56 @@ enum Animation {
+     },
+ }
+ 
++/// A window changing size, as when maximized: it's animated once its client
++/// has drawn itself at the new size, under a picture of how it was.
++#[derive(Debug)]
++struct Resize {
++    /// The configure with the new size and until when it's waited for.
++    waiting: Option<(Serial, Instant)>,
++    /// A picture of the window before; `None` until taken, or if it can't be.
++    picture: Option<ResizePicture>,
++    wants_picture: bool,
++}
++
+ impl Animation {
++    /// Moving `mapped` from `previous_geometry`, and resizing it to `size`
++    /// with the configure `serial`.
++    fn tiled(
++        previous_geometry: Rectangle<i32, Local>,
++        size: Size<i32, Local>,
++        serial: Option<Serial>,
++    ) -> Self {
++        let resize = serial
++            .filter(|_| previous_geometry.size != size)
++            .map(|serial| {
++                Box::new(Resize {
++                    waiting: Some((serial, Instant::now() + RESIZE_WAIT)),
++                    picture: None,
++                    wants_picture: true,
++                })
++            });
++        Animation::Tiled {
++            start: Instant::now(),
++            previous_geometry,
++            resize,
++        }
++    }
++
++    /// Waiting for the window to draw itself at its new size.
++    fn waiting(&self) -> bool {
++        matches!(self, Animation::Tiled { resize: Some(resize), .. } if resize.waiting.is_some())
++    }
++
++    fn picture(&self) -> Option<&ResizePicture> {
++        match self {
++            Animation::Tiled {
++                resize: Some(resize),
++                ..
++            } => resize.picture.as_ref(),
++            _ => None,
++        }
++    }
++
+     fn start(&self) -> &Instant {
+         match self {
+             Animation::Tiled { start, .. } => start,
+@@ -111,6 +166,9 @@ impl Animation {
+ 
+     /// How far along it is, 0 to 1, eased like GNOME's.
+     fn progress(&self) -> f64 {
++        if self.waiting() {
++            return 0.0;
++        }
+         let duration = self.duration();
+         let linear = Instant::now()
+             .duration_since(*self.start())
+@@ -391,7 +449,7 @@ impl FloatingLayout {
+         mapped.set_tiled(true);
+         mapped.set_maximized(true);
+         mapped.set_geometry(geometry.to_global(&output));
+-        mapped.configure();
++        let serial = mapped.configure();
+ 
+         if let Some(pos) = self.spawn_order.iter().position(|m| m == &mapped) {
+             self.spawn_order.truncate(pos);
+@@ -409,19 +467,13 @@ impl FloatingLayout {
+                     }
+                     Animation::Minimize { .. } | Animation::Tiled { .. } => {}
+                     Animation::Open { .. } => {
+-                        *existing_anim = Animation::Tiled {
+-                            start: Instant::now(),
+-                            previous_geometry,
+-                        };
++                        *existing_anim = Animation::tiled(previous_geometry, geometry.size, serial);
+                     }
+                 }
+             } else {
+                 self.animations.insert(
+                     mapped.clone(),
+-                    Animation::Tiled {
+-                        start: Instant::now(),
+-                        previous_geometry,
+-                    },
++                    Animation::tiled(previous_geometry, geometry.size, serial),
+                 );
+             }
+         } else {
+@@ -640,15 +692,12 @@ impl FloatingLayout {
+ 
+         mapped.set_tiled(false);
+         mapped.set_geometry(Rectangle::new(position, win_geo.size).to_global(&output));
+-        mapped.configure();
++        let serial = mapped.configure();
+ 
+         if let Some(previous_geometry) = prev.or(already_mapped) {
+             self.animations.insert(
+                 mapped.clone(),
+-                Animation::Tiled {
+-                    start: Instant::now(),
+-                    previous_geometry,
+-                },
++                Animation::tiled(previous_geometry, win_geo.size, serial),
+             );
+         }
+         self.space.map_element(mapped, position.as_logical(), false);
+@@ -1462,10 +1511,57 @@ impl FloatingLayout {
+         self.dirty.swap(false, Ordering::SeqCst) || !self.animations.is_empty()
+     }
+ 
++    /// The windows about to change size wanting a picture of how they look.
++    pub fn wanting_pictures(&self) -> Vec<CosmicMapped> {
++        self.animations
++            .iter()
++            .filter(|(_, anim)| {
++                matches!(anim, Animation::Tiled { resize: Some(resize), .. } if resize.wants_picture)
++            })
++            .map(|(mapped, _)| mapped.clone())
++            .collect()
++    }
++
++    /// Gives `mapped` its picture, or gives it back if it isn't here.
++    pub fn set_picture(
++        &mut self,
++        mapped: &CosmicMapped,
++        picture: Option<ResizePicture>,
++    ) -> Option<Option<ResizePicture>> {
++        match self.animations.get_mut(mapped) {
++            Some(Animation::Tiled {
++                resize: Some(resize),
++                ..
++            }) if resize.wants_picture => {
++                resize.wants_picture = false;
++                resize.picture = picture;
++                None
++            }
++            _ => Some(picture),
++        }
++    }
++
+     pub fn update_animation_state(&mut self) {
+         let was_empty = self.animations.is_empty();
+-        self.animations
+-            .retain(|_, anim| Instant::now().duration_since(*anim.start()) < anim.duration());
++        let now = Instant::now();
++        for (mapped, anim) in self.animations.iter_mut() {
++            // Resized: animated from now on.
++            if let Animation::Tiled {
++                start,
++                resize: Some(resize),
++                ..
++            } = anim
++                && let Some((serial, until)) = resize.waiting
++                && (mapped.active_window().serial_past(&serial) || now >= until || !mapped.alive())
++            {
++                resize.waiting = None;
++                resize.wants_picture = false;
++                *start = now;
++            }
++        }
++        self.animations.retain(|_, anim| {
++            anim.waiting() || Instant::now().duration_since(*anim.start()) < anim.duration()
++        });
+         if self.animations.is_empty() != was_empty {
+             self.dirty.store(true, Ordering::SeqCst);
+         }
+@@ -1552,6 +1648,11 @@ impl FloatingLayout {
+         };
+         let output_scale = output.current_scale().fractional_scale();
+         let mut lower_elements = SmallVec::<[_; 4]>::new_const();
++        let blur_strength = if theme.frosted_windows {
++            (theme.frosted as u8 + 1) as usize
++        } else {
++            0
++        };
+ 
+         for elem in self
+             .animations
+@@ -1683,19 +1784,38 @@ impl FloatingLayout {
+                 }
+             };
+ 
+-            elem.push_render_elements(
+-                renderer,
+-                render_location
+-                    .as_logical()
+-                    .to_physical_precise_round(output_scale),
+-                None,
+-                output_scale.into(),
+-                alpha,
+-                None,
+-                scanout_node,
+-                &mut |elem| push(map_anim(elem)),
+-                &mut |elem| lower_elements.push(map_anim(elem)),
+-            );
++            // Changing size: how it was, over it, until it has drawn itself
++            // at the new size and then fading out.
++            let resizing = self.animations.get(elem);
++            let picture = resizing.and_then(Animation::picture);
++            let waiting = resizing.is_some_and(Animation::waiting);
++            if let Some(picture) = picture {
++                let fade = resizing.map_or(1.0, |anim| 1.0 - anim.progress() as f32);
++                picture.push_render_elements(
++                    renderer,
++                    geometry.as_logical().to_f64(),
++                    output_scale,
++                    alpha * fade,
++                    blur_strength,
++                    push,
++                );
++            }
++
++            if !(waiting && picture.is_some()) {
++                elem.push_render_elements(
++                    renderer,
++                    render_location
++                        .as_logical()
++                        .to_physical_precise_round(output_scale),
++                    None,
++                    output_scale.into(),
++                    alpha,
++                    None,
++                    scanout_node,
++                    &mut |elem| push(map_anim(elem)),
++                    &mut |elem| lower_elements.push(map_anim(elem)),
++                );
++            }
+             if let Some(shadow_element) = elem.shadow_render_element(
+                 renderer,
+                 render_location
+diff --git a/src/shell/mod.rs b/src/shell/mod.rs
+index 5a43857..9ae961a 100644
+--- a/src/shell/mod.rs
++++ b/src/shell/mod.rs
+@@ -94,6 +94,7 @@ use crate::{
+ };
+ 
+ pub mod close_animation;
++pub mod resize_animation;
+ pub mod layer_animation;
+ pub mod element;
+ pub mod focus;
+diff --git a/src/shell/resize_animation.rs b/src/shell/resize_animation.rs
+new file mode 100644
+index 0000000..61bf145
+--- /dev/null
++++ b/src/shell/resize_animation.rs
+@@ -0,0 +1,197 @@
++//! Windows changing size, as when maximized, like GNOME's: a picture of the
++//! window is taken before its client hears of the new size, and shown in its
++//! place until the client has drawn itself at that size. Then the window
++//! grows (or shrinks) from the old size to the new one, under the picture,
++//! stretched along and fading out.
++//!
++//! COSMIC's apps are see-through and blurred, unless maximized: the picture
++//! keeps the blur behind it, so that fades out too instead of going at once.
++
++use anyhow::Context;
++use smithay::{
++    backend::renderer::element::{
++        Kind, RenderElement,
++        memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
++    },
++    desktop::space::SpaceElement,
++    output::Output,
++    utils::{Logical, Point, Rectangle, Size},
++    wayland::seat::WaylandFocus,
++};
++use tracing::{debug, warn};
++
++use crate::{
++    backend::render::{RendererRef, element::AsGlowRenderer, wayland::SurfaceRenderElement},
++    shell::{
++        close_animation::picture_mapped,
++        element::{CosmicMapped, CosmicMappedRenderElement, window::CosmicWindowRenderElement},
++        layer_animation::ClosingBlur,
++    },
++    state::{State, advertised_node_for_surface},
++    utils::iced::IcedRenderElement,
++};
++
++#[derive(Debug)]
++pub struct ResizePicture {
++    buffer: MemoryRenderBuffer,
++    /// What's pictured, from the window's origin: the window and what its
++    /// client draws around it.
++    area: Rectangle<i32, Logical>,
++    /// The picture's size in pixels.
++    pixels: Size<i32, Logical>,
++    /// The window's size then.
++    size: Size<i32, Logical>,
++    blur: Option<ClosingBlur>,
++}
++
++impl ResizePicture {
++    fn new<R>(renderer: &mut R, mapped: &CosmicMapped, scale: f64) -> anyhow::Result<Self>
++    where
++        R: AsGlowRenderer,
++        R::TextureId: Send + Clone + 'static,
++        R::Error: Send + Sync + 'static,
++        CosmicMappedRenderElement<R>: RenderElement<R>,
++    {
++        let (buffer, bbox, pixels) = picture_mapped(renderer, mapped, scale)?;
++        let geometry = mapped.geometry();
++        let blur = mapped
++            .active_window()
++            .wl_surface()
++            .and_then(|surface| ClosingBlur::of(&surface, Rectangle::from_size(geometry.size)));
++        Ok(ResizePicture {
++            buffer,
++            area: Rectangle::new(bbox.loc - geometry.loc, bbox.size),
++            pixels,
++            size: geometry.size,
++            blur,
++        })
++    }
++
++    /// The picture over the window at `window`, with the blur it had under
++    /// it: topmost first.
++    pub fn push_render_elements<R>(
++        &self,
++        renderer: &mut R,
++        window: Rectangle<f64, Logical>,
++        output_scale: f64,
++        alpha: f32,
++        blur_strength: usize,
++        push: &mut dyn FnMut(CosmicMappedRenderElement<R>),
++    ) where
++        R: AsGlowRenderer,
++        R::TextureId: Send + Clone + 'static,
++        CosmicMappedRenderElement<R>: RenderElement<R>,
++    {
++        if alpha <= 0.0 {
++            return;
++        }
++        let x = window.size.w / self.size.w.max(1) as f64;
++        let y = window.size.h / self.size.h.max(1) as f64;
++        let loc = window.loc
++            + Point::from((self.area.loc.x as f64 * x, self.area.loc.y as f64 * y));
++        let size = Size::<f64, Logical>::from((
++            self.area.size.w as f64 * x,
++            self.area.size.h as f64 * y,
++        ));
++        if let Ok(elem) = MemoryRenderBufferRenderElement::from_buffer(
++            renderer,
++            loc.to_physical(output_scale),
++            &self.buffer,
++            Some(alpha),
++            // all of it, stretched to `size`
++            Some(Rectangle::from_size(self.pixels.to_f64())),
++            Some(size.to_i32_round()),
++            Kind::Unspecified,
++        ) {
++            push(IcedRenderElement::UI(elem).into());
++        }
++        if let Some(blur) = self.blur.as_ref().filter(|_| blur_strength > 0)
++            && let Some(elem) = blur.element_in(renderer, window, alpha, output_scale, blur_strength)
++        {
++            push(CosmicMappedRenderElement::Window(
++                CosmicWindowRenderElement::Window(SurfaceRenderElement::Blur(elem)),
++            ));
++        }
++    }
++}
++
++/// Takes the pictures windows about to change size want, of how they look
++/// now. Called before the clients are sent what happened, so they haven't
++/// drawn themselves anew yet.
++pub fn picture_resizing_windows(state: &mut State) {
++    let wanted: Vec<(CosmicMapped, Output)> = {
++        let shell = state.common.shell.read();
++        let mut wanted = Vec::new();
++        for set in shell.workspaces.sets.values() {
++            for mapped in set.sticky_layer.wanting_pictures() {
++                wanted.push((mapped, set.output.clone()));
++            }
++            for workspace in &set.workspaces {
++                for mapped in workspace.floating_layer.wanting_pictures() {
++                    wanted.push((mapped, workspace.output.clone()));
++                }
++            }
++        }
++        wanted
++    };
++    if wanted.is_empty() {
++        return;
++    }
++
++    let dh = state.common.display_handle.clone();
++    let mut pictures = Vec::with_capacity(wanted.len());
++    for (mapped, output) in wanted {
++        let visible = {
++            let shell = state.common.shell.read();
++            shell.workspaces.sets.get(&output).is_some_and(|set| {
++                set.sticky_layer.mapped().any(|m| m == &mapped)
++                    || shell
++                        .active_space(&output)
++                        .is_some_and(|workspace| workspace.floating_layer.mapped().any(|m| m == &mapped))
++            })
++        };
++        let picture = if visible {
++            let start = std::time::Instant::now();
++            let scale = output.current_scale().fractional_scale();
++            let surface = mapped.active_window().wl_surface().map(|s| s.into_owned());
++            state
++                .backend
++                .offscreen_renderer(|kms| {
++                    surface
++                        .as_ref()
++                        .and_then(|surface| advertised_node_for_surface(surface, &dh))
++                        .or(*kms.primary_node.read().unwrap())
++                })
++                .context("No renderer to picture the window")
++                .and_then(|renderer| match renderer {
++                    RendererRef::Glow(renderer) => ResizePicture::new(renderer, &mapped, scale),
++                    RendererRef::GlMulti(mut renderer) => {
++                        ResizePicture::new(&mut renderer, &mapped, scale)
++                    }
++                })
++                .inspect(|_| debug!(took = ?start.elapsed(), "Pictured a window changing size"))
++                .map_err(|err| warn!(?err, "Failed to picture the window"))
++                .ok()
++        } else {
++            None
++        };
++        pictures.push((mapped, picture));
++    }
++
++    let mut shell = state.common.shell.write();
++    for (mapped, picture) in pictures {
++        let mut picture = Some(picture);
++        for set in shell.workspaces.sets.values_mut() {
++            let layers = std::iter::once(&mut set.sticky_layer).chain(
++                set.workspaces
++                    .iter_mut()
++                    .map(|workspace| &mut workspace.floating_layer),
++            );
++            for layer in layers {
++                if let Some(taken) = picture.take() {
++                    picture = layer.set_picture(&mapped, taken);
++                }
++            }
++        }
++    }
++}
