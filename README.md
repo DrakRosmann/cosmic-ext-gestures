@@ -34,6 +34,19 @@ As ações que abrem algo esperam os dedos andarem um pouco (60 px), para um toq
 abrir nada. A visão geral do COSMIC é um programa à parte (`cosmic-workspaces`): ela abre
 quando o gesto passa desse ponto, sem crescer junto com os dedos como no GNOME.
 
+## Super + scroll
+
+Como no GNOME: segurar Super (a tecla do Windows) e rolar troca de espaço de trabalho,
+para baixo ou para a direita o próximo, para cima ou para a esquerda o anterior. Cada
+"clique" da roda é um espaço; no touchpad, dois dedos com Super trocam um espaço por vez,
+até os dedos pararem. No COSMIC, Super + scroll era o zoom da acessibilidade: com o patch,
+o zoom passa para Super + Ctrl + scroll.
+
+| Versão do `cosmic-comp` | Patches |
+| --- | --- |
+| 1.8.0 | gestos, animações das janelas, animações das camadas |
+| 1.9.0 | Super + scroll (os outros ainda não foram atualizados para ela) |
+
 ## Animações
 
 Como no GNOME (os tempos e as curvas são os do `gnome-shell`):
@@ -76,8 +89,9 @@ O `cosmic-comp` pede um Rust recente (1.93 para o 1.8.0), mais novo que o de vá
 distribuições (Debian, Ubuntu e Pop!_OS LTS). Se o do sistema for antigo, o script avisa:
 instale o Rust pelo [rustup](https://rustup.rs) e rode de novo.
 
-Os patches são para o `cosmic-comp` 1.8.0. Com outra versão, o script avisa e para: o
-patch precisa ser atualizado para ela.
+Há patches para o `cosmic-comp` 1.8.0 e 1.9.0 (veja a tabela em Super + scroll), e o
+script aplica os da versão instalada. Com outra versão, ele avisa e para: os patches
+precisam ser atualizados para ela.
 
 Se a sessão não abrir: Ctrl+Alt+F3, entre, e rode `sudo mv /usr/bin/cosmic-comp.orig
 /usr/bin/cosmic-comp`, ou reinstale o pacote:
@@ -119,7 +133,9 @@ animations GNOME's: windows open growing from their bottom middle and close shri
 and fading, and minimizing, maximizing and switching workspaces use GNOME's timing and
 curves. A third one animates the shell's layers like GNOME's: the app library,
 the launcher, the workspaces overview (the windows fading out under it) and the
-panel's popups fade in growing into place, and close the other way.
+panel's popups fade in growing into place, and close the other way. For `cosmic-comp` 1.9.0
+there is, so far, a patch for Super and scrolling, as in GNOME: Super and the wheel (or
+two fingers) switch workspaces; the accessibility zoom moves to Super, Ctrl and the wheel.
 
 It works on Fedora, Debian and its derivatives (Ubuntu, Pop!_OS, Mint…) and Arch and its
 derivatives: `compositor/install.sh` finds the installed `cosmic-comp` version with `rpm`,
