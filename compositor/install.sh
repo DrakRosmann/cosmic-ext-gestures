@@ -1,7 +1,8 @@
 #!/bin/sh
-# Build cosmic-comp, the version the system has, with the gestures and the
-# animations patches (windows, and the shell's layers), and put it in place of the system's, keeping that one as
-# cosmic-comp.orig.
+# Build cosmic-comp, the version the system has, with the patches there are
+# for it (the gestures, the animations of windows and of the shell's layers,
+# Super and scrolling for workspaces), and put it in place of the system's,
+# keeping that one as cosmic-comp.orig.
 #   compositor/install.sh          # the version installed (rpm, dpkg or pacman)
 #   compositor/install.sh 1.8.0    # or say which
 # Then log out and back in. compositor/restore.sh puts the original back.
@@ -26,14 +27,15 @@ if [ -z "$version" ]; then
     echo "Which cosmic-comp version? Like: $0 1.8.0" >&2
     exit 1
 fi
-patches="$here/cosmic-comp-$version-gestures.patch $here/cosmic-comp-$version-animations.patch
-    $here/cosmic-comp-$version-layer-animations.patch"
+patches=$(ls "$here"/cosmic-comp-"$version"-*.patch 2>/dev/null || true)
+if [ -z "$patches" ]; then
+    echo "There is no patch for cosmic-comp $version yet; there are for:" >&2
+    ls "$here" | sed -n 's/^cosmic-comp-\([0-9.]*\)-.*\.patch$/  \1/p' | sort -u >&2
+    exit 1
+fi
+echo "Patches for cosmic-comp $version:"
 for patch in $patches; do
-    if [ ! -f "$patch" ]; then
-        echo "There is no patch for cosmic-comp $version yet; there are for:" >&2
-        ls "$here" | sed -n 's/^cosmic-comp-\(.*\)-gestures\.patch$/  \1/p' >&2
-        exit 1
-    fi
+    echo "  $(basename "$patch")"
 done
 
 src="${XDG_CACHE_HOME:-$HOME/.cache}/cosmic-ext-gestures/cosmic-comp-$version"

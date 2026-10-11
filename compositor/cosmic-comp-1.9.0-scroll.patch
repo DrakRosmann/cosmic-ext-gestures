@@ -1,0 +1,127 @@
+diff --git a/src/input/actions.rs b/src/input/actions.rs
+index 8639ba6..ff92d47 100644
+--- a/src/input/actions.rs
++++ b/src/input/actions.rs
+@@ -1139,6 +1139,56 @@ impl State {
+     }
+ }
+ 
++impl State {
++    /// Super and scrolling, as in GNOME: down or right to the next
++    /// workspace, up or left to the previous; a notch of the wheel is one
++    /// switch, a touchpad's scroll is one until its fingers stop.
++    pub fn scroll_workspaces(&mut self, seat: &Seat<State>, steps: f64, touchpad: bool) {
++        if steps == 0. {
++            // the fingers lifted
++            self.common.workspace_scroll = Some(0.);
++            return;
++        }
++        let Some(scrolled) = self.common.workspace_scroll else {
++            return;
++        };
++        // Also tells cosmic-ext-gestures' install.sh this compositor is patched.
++        static NOTED: std::sync::Once = std::sync::Once::new();
++        NOTED.call_once(|| {
++            info!("Super and scrolling switch workspaces (io.github.DrakRosmann.CosmicGestures)")
++        });
++        // Back the other way: from there.
++        let scrolled = if scrolled * steps < 0. { steps } else { scrolled + steps };
++        if scrolled.abs() < 1. {
++            self.common.workspace_scroll = Some(scrolled);
++            return;
++        }
++        self.common.workspace_scroll = if touchpad {
++            None
++        } else {
++            Some(scrolled - scrolled.signum())
++        };
++        let wraparound = self.common.config.cosmic_conf.workspaces.workspace_wraparound;
++        let _ = if scrolled > 0. {
++            to_next_workspace(
++                &mut self.common.shell.write(),
++                seat,
++                false,
++                wraparound,
++                &mut self.common.workspace_state.update(),
++            )
++        } else {
++            to_previous_workspace(
++                &mut self.common.shell.write(),
++                seat,
++                false,
++                wraparound,
++                &mut self.common.workspace_state.update(),
++            )
++        };
++    }
++}
++
+ fn to_next_workspace(
+     shell: &mut Shell,
+     seat: &Seat<State>,
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index af160ae..286c04a 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -211,6 +211,9 @@ impl ModifiersShortcutQueue {
+     }
+ }
+ 
++/// How far two fingers scroll on a touchpad, with Super, to switch workspaces.
++const WORKSPACE_SCROLL_DISTANCE: f64 = 60.;
++
+ impl State {
+     #[profiling::function]
+     pub fn process_input_event<B: InputBackend>(
+@@ -1062,7 +1065,27 @@ impl State {
+                     self.common.idle_notifier_state.notify_activity(&seat);
+                     notify_cursor_activity(self, &seat);
+ 
+-                    if self.source_modifiers(&backend_id, &seat).logo
++                    let modifiers = self.source_modifiers(&backend_id, &seat);
++                    if modifiers.logo && !modifiers.ctrl {
++                        // As in GNOME: Super and the wheel switch workspaces.
++                        seat.modifiers_shortcut_queue().clear(&backend_id);
++                        let steps = |axis| {
++                            event
++                                .amount_v120(axis)
++                                .map(|val| val / 120.)
++                                .or_else(|| {
++                                    event.amount(axis).map(|val| val / WORKSPACE_SCROLL_DISTANCE)
++                                })
++                                .unwrap_or(0.)
++                        };
++                        let vertical = steps(Axis::Vertical);
++                        let steps = if vertical != 0. {
++                            vertical
++                        } else {
++                            steps(Axis::Horizontal)
++                        };
++                        self.scroll_workspaces(&seat, steps, event.source() == AxisSource::Finger);
++                    } else if modifiers.logo
+                         && self
+                             .common
+                             .config
+diff --git a/src/state.rs b/src/state.rs
+index 86f5e23..d78d569 100644
+--- a/src/state.rs
++++ b/src/state.rs
+@@ -248,6 +248,10 @@ pub struct Common {
+     pub kiosk_exit_code: Option<i32>,
+ 
+     pub gesture_state: Option<GestureState>,
++    /// Super and scrolling switch workspaces: the steps scrolled toward the
++    /// next switch; `None` once a touchpad's scroll has switched, until it
++    /// stops.
++    pub workspace_scroll: Option<f64>,
+ 
+     /// Active libei sender seats, keyed by their `eis` connection. Tracked so their virtual
+     /// keyboards can be re-created when the keyboard configuration changes at runtime.
+@@ -784,6 +788,7 @@ impl State {
+                 should_stop: false,
+                 kiosk_exit_code: None,
+                 gesture_state: None,
++                workspace_scroll: Some(0.0),
+                 ei_seats: std::collections::HashMap::new(),
+                 ei_keyboard_source: std::collections::HashMap::new(),
+                 ei_pointer_buttons: std::collections::HashMap::new(),
